@@ -1,0 +1,19 @@
+{
+  "name": "codebase-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "^0.17.0",
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "ignore": "^7.0.3",
+    "openai": "^4.83.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
