@@ -132,7 +132,7 @@ export class LanceDBStore {
         const l2Dist = (r._distance as number) ?? 0;
         const vectorScore = 1 - l2Dist / 2;
         const ftsScore = ftsScores.get(id) || 0;
-        const finalScore = vectorScore + ftsScore * 0.3;
+        const finalScore = vectorScore * 0.4 + ftsScore * 0.6;
 
         let metadata: Record<string, unknown> = {};
         try {

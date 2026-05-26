@@ -10,19 +10,48 @@ const SUPPORTED_EXTENSIONS = new Set([
 ]);
 
 const DEFAULT_IGNORE_PATTERNS = [
+  // Build & tools
   "node_modules",
   ".git",
   ".dart_tool",
   "build",
+  ".build",
+  "buildSystem",
+  ".gradle",
+  "gradle",
+  "Pods",
+  "pubcachePath",
+  // Platform generated dirs
+  ".ios",
+  ".android",
+  "ios/Runner/Generated.xcconfig",
+  // IDE & config
   ".idea",
   ".vscode",
+  ".DS_Store",
   "*.lock",
+  // Generated code
   "*.g.dart",
   "*.freezed.dart",
   "*.gr.dart",
-  ".DS_Store",
-  "Pods",
-  ".gradle",
+  "*.g.yaml",
+  // Assets (not code)
+  "*.png",
+  "*.jpg",
+  "*.jpeg",
+  "*.gif",
+  "*.svg",
+  "*.ico",
+  "*.pdf",
+  "*.zip",
+  "*.ttf",
+  "*.woff*",
+  "*.mp4",
+  "*.mp3",
+  "*.webp",
+  // IDE / project files
+  "xcuserdata",
+  "xcshareddata",
   ".bundle",
   "*.png",
   "*.jpg",
