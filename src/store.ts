@@ -114,16 +114,24 @@ export class LanceDBStore {
     // Hybrid: merge with FTS results (RRF-style ranking)
     // If FTS is available, we do a separate FTS search and merge
     let ftsScores = new Map<string, number>();
+    let ftsWorked = false;
     try {
       const ftsResults = await tbl.search(queryText).limit(limit).toArray();
-      ftsResults.forEach((r: Record<string, unknown>, i: number) => {
-        const id = r.id as string;
-        const rankScore = 1 / (60 + i + 1); // RRF k=60
-        ftsScores.set(id, rankScore);
-      });
+      ftsWorked = ftsResults.length > 0;
+      if (ftsWorked) {
+        ftsResults.forEach((r: Record<string, unknown>, i: number) => {
+          const id = r.id as string;
+          const rankScore = 1 / (60 + i + 1); // RRF k=60
+          ftsScores.set(id, rankScore);
+        });
+      }
     } catch {
       // FTS might not be available; vector-only results are fine
     }
+
+    const vectorWeight = ftsWorked ? 0.4 : 1.0;
+    const ftsWeight = ftsWorked ? 0.6 : 0.0;
+    const scoreThreshold = ftsWorked ? 0.3 : 0.15;
 
     const results: SearchResult[] = vectorResults.map(
       (r: Record<string, unknown>, i: number) => {
@@ -132,7 +140,7 @@ export class LanceDBStore {
         const l2Dist = (r._distance as number) ?? 0;
         const vectorScore = 1 - l2Dist / 2;
         const ftsScore = ftsScores.get(id) || 0;
-        const finalScore = vectorScore * 0.4 + ftsScore * 0.6;
+        const finalScore = vectorScore * vectorWeight + ftsScore * ftsWeight;
 
         let metadata: Record<string, unknown> = {};
         try {
@@ -155,7 +163,7 @@ export class LanceDBStore {
     return results
       .sort((a, b) => b.score - a.score)
       .slice(0, limit)
-      .filter((r) => r.score > 0.3);
+      .filter((r) => r.score > scoreThreshold);
   }
 
   async deleteByIds(name: string, ids: string[]): Promise<void> {
