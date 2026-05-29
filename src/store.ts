@@ -129,18 +129,18 @@ export class LanceDBStore {
       // FTS might not be available; vector-only results are fine
     }
 
-    const vectorWeight = ftsWorked ? 0.4 : 1.0;
-    const ftsWeight = ftsWorked ? 0.6 : 0.0;
-    const scoreThreshold = ftsWorked ? 0.3 : 0.15;
+    const vectorWeight = 1.0;
+    const ftsWeight = ftsWorked ? 0.0 : 0.0;
+    const scoreThreshold = 0.15;
 
     const results: SearchResult[] = vectorResults.map(
       (r: Record<string, unknown>, i: number) => {
         const id = r.id as string;
-        // L2 distance for normalized vectors: score = 1 - distance/2
         const l2Dist = (r._distance as number) ?? 0;
         const vectorScore = 1 - l2Dist / 2;
         const ftsScore = ftsScores.get(id) || 0;
-        const finalScore = vectorScore * vectorWeight + ftsScore * ftsWeight;
+        const ftsBonus = ftsWorked ? ftsScore * 5 : 0;
+        const finalScore = vectorScore * vectorWeight + ftsBonus;
 
         let metadata: Record<string, unknown> = {};
         try {

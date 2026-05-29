@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import { execSync } from "child_process";
 import ignore from "ignore";
 import { createHash } from "crypto";
 
@@ -10,26 +11,33 @@ const SUPPORTED_EXTENSIONS = new Set([
 ]);
 
 const DEFAULT_IGNORE_PATTERNS = [
+  // Version control
+  ".git",
   // Build & tools
   "node_modules",
-  ".git",
-  ".dart_tool",
   "build",
   ".build",
   "buildSystem",
+  ".dart_tool",
+  "ephemeral",
   ".gradle",
   "gradle",
   "Pods",
   "pubcachePath",
+  ".pub-cache",
   // Platform generated dirs
   ".ios",
   ".android",
   "ios/Runner/Generated.xcconfig",
+  "ios/Flutter/Generated.xcconfig",
   // IDE & config
   ".idea",
   ".vscode",
   ".DS_Store",
   "*.lock",
+  "xcuserdata",
+  "xcshareddata",
+  ".bundle",
   // Generated code
   "*.g.dart",
   "*.freezed.dart",
@@ -44,35 +52,19 @@ const DEFAULT_IGNORE_PATTERNS = [
   "*.ico",
   "*.pdf",
   "*.zip",
-  "*.ttf",
-  "*.woff*",
-  "*.mp4",
-  "*.mp3",
-  "*.webp",
-  // IDE / project files
-  "xcuserdata",
-  "xcshareddata",
-  ".bundle",
-  "*.png",
-  "*.jpg",
-  "*.jpeg",
-  "*.gif",
-  "*.svg",
-  "*.ico",
-  "*.pdf",
-  "*.zip",
   "*.tar.gz",
   "*.ttf",
+  "*.otf",
   "*.woff",
   "*.woff2",
-  "*.otf",
   "*.mp4",
   "*.mp3",
   "*.wav",
   "*.webp",
-  "*.cmake",
+  // Xcode / CMake
   "*.xcodeproj",
   "*.xcworkspace",
+  "*.cmake",
 ];
 
 export class FileSynchronizer {
@@ -127,7 +119,44 @@ export class FileSynchronizer {
     });
   }
 
+  private async isGitRepo(dir: string): Promise<boolean> {
+    try {
+      const stat = await fs.stat(path.join(dir, ".git"));
+      // .git can be a directory (regular repo) or a file (gitlinks, submodules)
+      return stat.isDirectory() || stat.isFile();
+    } catch {
+      return false;
+    }
+  }
+
+  private async walkGitRepo(dir: string, result: string[]): Promise<void> {
+    try {
+      const output = execSync(
+        "git ls-files --cached --others --exclude-standard",
+        { cwd: dir, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 }
+      );
+      for (const line of output.split("\n")) {
+        const relativePath = line.trim();
+        if (!relativePath) continue;
+        result.push(path.join(dir, relativePath));
+      }
+    } catch {
+      // git failed, fallback to walk + ignore
+      await this.walkDirFallback(dir, result);
+    }
+  }
+
   private async walkDir(dir: string, result: string[]): Promise<void> {
+    // Nested git repo (submodule): use git ls-files so its own .gitignore is respected
+    // The root directory (codebasePath) is already covered by loadIgnoreFiles, so skip git ls-files there
+    if (dir !== this.codebasePath && (await this.isGitRepo(dir))) {
+      await this.walkGitRepo(dir, result);
+      return;
+    }
+    await this.walkDirFallback(dir, result);
+  }
+
+  private async walkDirFallback(dir: string, result: string[]): Promise<void> {
     let entries;
     try {
       entries = await fs.readdir(dir, { withFileTypes: true });
