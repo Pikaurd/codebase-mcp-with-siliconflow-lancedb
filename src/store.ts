@@ -38,7 +38,7 @@ export class LanceDBStore {
     const db = this.ensureConnected();
     try {
       await db.dropTable(name);
-    } catch {}
+    } catch { }
   }
 
   async compactTable(name: string): Promise<void> {
@@ -145,7 +145,7 @@ export class LanceDBStore {
         let metadata: Record<string, unknown> = {};
         try {
           metadata = JSON.parse((r.metadata as string) || "{}");
-        } catch {}
+        } catch { }
 
         return {
           id,
@@ -169,9 +169,21 @@ export class LanceDBStore {
   async deleteByIds(name: string, ids: string[]): Promise<void> {
     const db = this.ensureConnected();
     const tbl = await db.openTable(name);
-    // LanceDB uses Arrow predicates for deletion
-    // For now, rebuild the table without deleted rows
-    // This is not efficient for large datasets but works for codebases
+
+    // Try native row-level delete first
+    try {
+      const escaped = ids.map((id) => `'${id.replace(/'/g, "''")}'`);
+      const BATCH = 200;
+      for (let i = 0; i < escaped.length; i += BATCH) {
+        const batch = escaped.slice(i, i + BATCH).join(", ");
+        await tbl.delete(`id IN (${batch})`);
+      }
+      return;
+    } catch {
+      console.error("[store] native delete (by id) failed, falling back to drop+recreate");
+    }
+
+    // Fallback: full table rebuild
     const all = await tbl.toArray();
     const filtered = all.filter(
       (r: Record<string, unknown>) => !ids.includes(r.id as string)
@@ -184,7 +196,54 @@ export class LanceDBStore {
           config: lancedb.Index.fts(),
           replace: true,
         });
-      } catch {}
+      } catch { }
+    } else {
+      await db.createTable(name, [], { mode: "create" });
+    }
+  }
+
+  /**
+   * Delete all chunks belonging to the given relative paths.
+   * Uses LanceDB native row-level delete (SQL predicate) to avoid
+   * the destructive drop+recreate pattern.
+   * Falls back to drop+recreate if native delete is unavailable.
+   */
+  async deleteByRelativePaths(name: string, relativePaths: string[]): Promise<void> {
+    if (relativePaths.length === 0) return;
+    const db = this.ensureConnected();
+    const tbl = await db.openTable(name);
+
+    // Try native row-level delete first (LanceDB ^0.17.0 supports it)
+    try {
+      // Escape single quotes and wrap each path in quotes for SQL IN clause
+      const escaped = relativePaths.map((p) => `'${p.replace(/'/g, "''")}'`);
+      // Batch deletes in chunks to avoid overly long SQL strings
+      const BATCH = 200;
+      for (let i = 0; i < escaped.length; i += BATCH) {
+        const batch = escaped.slice(i, i + BATCH).join(", ");
+        await tbl.delete(`relativePath IN (${batch})`);
+      }
+      return;
+    } catch {
+      // Native delete failed; fall back to drop+recreate for compatibility
+      console.error("[store] native delete failed, falling back to drop+recreate");
+    }
+
+    // Fallback: full table rebuild
+    const pathSet = new Set(relativePaths);
+    const all = await tbl.toArray();
+    const filtered = all.filter(
+      (r: Record<string, unknown>) => !pathSet.has(r.relativePath as string)
+    );
+    await db.dropTable(name);
+    if (filtered.length > 0) {
+      const newTbl = await db.createTable(name, filtered as lancedb.Data);
+      try {
+        await newTbl.createIndex("text", {
+          config: lancedb.Index.fts(),
+          replace: true,
+        });
+      } catch { }
     } else {
       await db.createTable(name, [], { mode: "create" });
     }
@@ -194,7 +253,7 @@ export class LanceDBStore {
     const db = this.ensureConnected();
     try {
       await db.dropTable(name);
-    } catch {}
+    } catch { }
   }
 
   async hasTable(name: string): Promise<boolean> {

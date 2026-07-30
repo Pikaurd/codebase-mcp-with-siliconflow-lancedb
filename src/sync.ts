@@ -193,12 +193,8 @@ export class FileSynchronizer {
   }
 
   async computeFileHash(filePath: string): Promise<string> {
-    try {
-      const content = await fs.readFile(filePath, "utf-8");
-      return this.hashContent(content);
-    } catch {
-      return "";
-    }
+    const content = await fs.readFile(filePath, "utf-8");
+    return this.hashContent(content);
   }
 
   setHashes(hashes: Record<string, string>): void {
@@ -230,8 +226,16 @@ export class FileSynchronizer {
     for (const filePath of currentFiles) {
       const relativePath = path.relative(this.codebasePath, filePath);
       currentPaths.add(relativePath);
-      const newHash = await this.computeFileHash(filePath);
-      if (newHash === "") continue;
+
+      let newHash: string;
+      try {
+        newHash = await this.computeFileHash(filePath);
+      } catch {
+        // File is unreadable (deleted between discover and read, permissions, etc.)
+        // Skip it — it will be picked up on the next sync.
+        console.error(`[sync] cannot read file: ${relativePath}`);
+        continue;
+      }
 
       const oldHash = this.hashes.get(relativePath);
       if (!oldHash || oldHash !== newHash) {

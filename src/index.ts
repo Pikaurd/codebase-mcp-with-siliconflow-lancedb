@@ -163,18 +163,179 @@ async function main() {
           const additionalIgnorePatterns =
             ((args as Record<string, unknown>).ignorePatterns as string[]) || [];
 
-          // Check if already indexed
+          // Prepare syncer for change detection
+          const syncer = new FileSynchronizer(absolutePath, additionalIgnorePatterns);
+          await syncer.loadIgnoreFiles();
+          const colName = syncer.getCollectionName();
+
           const existing = snapshot.codebases[absolutePath];
-          if (existing && existing.status === "indexed" && !force) {
+          const isIndexed = existing && existing.status === "indexed";
+          const hasTable = await store.hasTable(colName);
+
+          // --- Incremental update path ---
+          if (isIndexed && hasTable && !force) {
+            // Load stored hashes for change detection
+            syncer.setHashes(existing.fileHashes || {});
+            const { changed, removed } = await syncer.detectChanges();
+
+            if (changed.length === 0 && removed.length === 0) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Codebase '${absolutePath}' is up to date (${existing.indexedFiles} files, ${existing.totalChunks} chunks). No changes detected.`,
+                  },
+                ],
+              };
+            }
+
+            // Cancel existing task for this codebase
+            const existingTask = indexingTasks.get(absolutePath);
+            if (existingTask) {
+              existingTask.abort();
+            }
+
+            const controller = new AbortController();
+            indexingTasks.set(absolutePath, controller);
+
+            // Start incremental index in background
+            (async () => {
+              try {
+                const cs = snapshot.codebases[absolutePath];
+                cs.indexStatus = "in_progress";
+                cs.lastUpdated = new Date().toISOString();
+                await saveSnapshot(snapshotPath, snapshot);
+
+                // Remove hashes and chunks for deleted files
+                for (const rp of removed) {
+                  try {
+                    await store.deleteByRelativePaths(colName, [rp]);
+                  } catch (err) {
+                    console.error(`[index] failed to delete chunks for removed file: ${rp}: ${err instanceof Error ? err.message : String(err)}`);
+                  }
+                  syncer.removeHash(rp);
+                }
+
+                // Process each changed file with per-file atomicity:
+                // read + split + embed → delete old chunks → insert new → update hash
+                // If any step fails, skip the file and keep old data + old hash.
+                let processedFiles = 0;
+                let totalChunks = 0;
+
+                for (const filePath of changed) {
+                  if (controller.signal.aborted) break;
+
+                  const relativePath = path.relative(absolutePath, filePath);
+                  let content: string;
+                  try {
+                    content = await syncer.readFile(filePath);
+                  } catch (err) {
+                    console.error(`[index] read failed: ${relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+                    continue;
+                  }
+
+                  let chunks: Chunk[];
+                  try {
+                    chunks = splitCode(content, filePath, absolutePath);
+                  } catch (err) {
+                    console.error(`[index] split failed: ${relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+                    continue;
+                  }
+
+                  // Batch embedding for chunks of this file
+                  let documents: Document[];
+                  try {
+                    const contents = chunks.map((c) => c.content);
+                    const embeddings = await embedding.embed(contents);
+                    documents = chunks.map((chunk, i) => ({
+                      id: generateId(
+                        chunk.metadata.filePath.startsWith(absolutePath)
+                          ? path.relative(absolutePath, chunk.metadata.filePath)
+                          : chunk.metadata.filePath,
+                        chunk.startLine,
+                        chunk.endLine,
+                        chunk.content
+                      ),
+                      vector: normalize(embeddings[i].vector),
+                      text: chunk.content,
+                      relativePath: chunk.metadata.filePath.startsWith(absolutePath)
+                        ? path.relative(absolutePath, chunk.metadata.filePath)
+                        : chunk.metadata.filePath,
+                      startLine: chunk.startLine,
+                      endLine: chunk.endLine,
+                      fileExtension: path.extname(chunk.metadata.filePath),
+                      metadata: JSON.stringify(chunk.metadata),
+                      codebasePath: absolutePath,
+                    }));
+                  } catch (err) {
+                    console.error(`[index] embedding failed for ${relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+                    continue;
+                  }
+
+                  // Per-file atomic: delete old + insert new
+                  try {
+                    await store.deleteByRelativePaths(colName, [relativePath]);
+                  } catch (err) {
+                    console.error(`[index] failed to delete old chunks for ${relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+                    // Continue anyway — insert may succeed and old chunks will be stale
+                  }
+                  try {
+                    await store.insert(colName, documents);
+                  } catch (err) {
+                    console.error(`[index] insert failed for ${relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+                    continue; // Keep old hash so this file is retried next time
+                  }
+
+                  const hash = syncer.hashContent(content);
+                  syncer.updateHash(relativePath, hash);
+                  processedFiles++;
+                  totalChunks += chunks.length;
+                }
+
+                // Update snapshot
+                const cs2 = snapshot.codebases[absolutePath];
+                if (cs2 && !controller.signal.aborted) {
+                  cs2.status = "indexed";
+                  cs2.indexStatus = "completed";
+                  cs2.lastUpdated = new Date().toISOString();
+                  cs2.fileHashes = syncer.getHashes();
+                  // Recompute total stats: count rows in DB
+                  try {
+                    const rowCount = await store.getRowCount(colName);
+                    cs2.totalChunks = rowCount;
+                  } catch { }
+                  // Count unique files from current hashes
+                  cs2.indexedFiles = Object.keys(syncer.getHashes()).length;
+                }
+                await saveSnapshot(snapshotPath, snapshot);
+
+                console.error(`[index] ${path.basename(absolutePath)}: ${processedFiles}/${changed.length} changed, ${removed.length} removed (incremental)`);
+              } catch (err) {
+                console.error(`[index] Fatal: ${err instanceof Error ? err.message : String(err)}`);
+                const cs3 = snapshot.codebases[absolutePath];
+                if (cs3) {
+                  cs3.indexStatus = "failed";
+                  cs3.lastUpdated = new Date().toISOString();
+                }
+                await saveSnapshot(snapshotPath, snapshot);
+              } finally {
+                indexingTasks.delete(absolutePath);
+              }
+            })();
+
             return {
               content: [
                 {
                   type: "text",
-                  text: `Codebase '${absolutePath}' is already indexed (${existing.indexedFiles} files, ${existing.totalChunks} chunks). Use force=true to re-index.`,
+                  text: `Started incremental indexing for '${absolutePath}'.\n\n` +
+                    `${changed.length} files changed, ${removed.length} files removed.\n` +
+                    `Indexing is running in the background.`,
                 },
               ],
             };
           }
+
+          // --- Full re-index path (force or first-time) ---
 
           // Cancel existing task for this codebase
           const existingTask = indexingTasks.get(absolutePath);
@@ -200,18 +361,12 @@ async function main() {
               snapshot.codebases[absolutePath] = cs;
               await saveSnapshot(snapshotPath, snapshot);
 
-              const syncer = new FileSynchronizer(
-                absolutePath,
-                additionalIgnorePatterns
-              );
-              await syncer.loadIgnoreFiles();
               const files = await syncer.discoverFiles();
 
               const BATCH_SIZE = Math.max(
                 1,
                 parseInt(process.env.EMBEDDING_BATCH_SIZE || "10", 10)
               );
-              const colName = syncer.getCollectionName();
               const dim = await embedding.detectDimension();
 
               // Drop and recreate on force
@@ -357,10 +512,10 @@ async function main() {
 
           const filtered = extensionFilter.length > 0
             ? results.filter((r) =>
-                extensionFilter.some(
-                  (ext) => r.fileExtension.toLowerCase() === ext.toLowerCase()
-                )
+              extensionFilter.some(
+                (ext) => r.fileExtension.toLowerCase() === ext.toLowerCase()
               )
+            )
             : results;
 
           if (filtered.length === 0) {
@@ -445,7 +600,7 @@ async function main() {
             let actualRows = 0;
             try {
               actualRows = await store.getRowCount(colName);
-            } catch {}
+            } catch { }
             return {
               content: [
                 {
@@ -540,39 +695,83 @@ async function startBackgroundSync(
       if (changed.length === 0 && removed.length === 0) return;
 
       const colName = syncer.getCollectionName();
-      const BATCH_SIZE = Math.max(1, parseInt(process.env.EMBEDDING_BATCH_SIZE || "25", 10));
 
-      // Process changed files
-      let chunkBuffer: Chunk[] = [];
-      for (const filePath of changed) {
+      // Remove chunks and hashes for deleted files
+      for (const rp of removed) {
         try {
-          const content = await syncer.readFile(filePath);
-          const chunks = splitCode(content, filePath, codebasePath);
-
-          // Remove old chunks for this file
-          const relativePath = path.relative(codebasePath, filePath);
-          // Old chunks will be overwritten by new insert (same id)
-
-          for (const chunk of chunks) {
-            chunkBuffer.push(chunk);
-            if (chunkBuffer.length >= BATCH_SIZE) {
-              await processBatch(chunkBuffer, codebasePath, colName, embedding, store, syncer);
-              chunkBuffer = [];
-            }
-          }
-
-          const hash = syncer.hashContent(content);
-          syncer.updateHash(relativePath, hash);
+          await store.deleteByRelativePaths(colName, [rp]);
         } catch (err) {
-          chunkBuffer = [];
+          console.error(`[sync] failed to delete chunks for removed file: ${rp}: ${err instanceof Error ? err.message : String(err)}`);
         }
+        syncer.removeHash(rp);
       }
 
-      // Process remaining
-      if (chunkBuffer.length > 0) {
+      // Per-file atomic: process each changed file independently
+      let processedCount = 0;
+      for (const filePath of changed) {
+        const relativePath = path.relative(codebasePath, filePath);
+
+        let content: string;
         try {
-          await processBatch(chunkBuffer, codebasePath, colName, embedding, store, syncer);
-        } catch {}
+          content = await syncer.readFile(filePath);
+        } catch (err) {
+          console.error(`[sync] read failed: ${relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+          continue;
+        }
+
+        let chunks: Chunk[];
+        try {
+          chunks = splitCode(content, filePath, codebasePath);
+        } catch (err) {
+          console.error(`[sync] split failed: ${relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+          continue;
+        }
+
+        let documents: Document[];
+        try {
+          const contents = chunks.map((c) => c.content);
+          const embeddings = await embedding.embed(contents);
+          documents = chunks.map((chunk, i) => ({
+            id: generateId(
+              chunk.metadata.filePath.startsWith(codebasePath)
+                ? path.relative(codebasePath, chunk.metadata.filePath)
+                : chunk.metadata.filePath,
+              chunk.startLine,
+              chunk.endLine,
+              chunk.content
+            ),
+            vector: normalize(embeddings[i].vector),
+            text: chunk.content,
+            relativePath: chunk.metadata.filePath.startsWith(codebasePath)
+              ? path.relative(codebasePath, chunk.metadata.filePath)
+              : chunk.metadata.filePath,
+            startLine: chunk.startLine,
+            endLine: chunk.endLine,
+            fileExtension: path.extname(chunk.metadata.filePath),
+            metadata: JSON.stringify(chunk.metadata),
+            codebasePath,
+          }));
+        } catch (err) {
+          console.error(`[sync] embedding failed for ${relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+          continue;
+        }
+
+        // Per-file atomic: delete old + insert new
+        try {
+          await store.deleteByRelativePaths(colName, [relativePath]);
+        } catch (err) {
+          console.error(`[sync] failed to delete old chunks for ${relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        try {
+          await store.insert(colName, documents);
+        } catch (err) {
+          console.error(`[sync] insert failed for ${relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+          continue; // Keep old hash so this file retries next time
+        }
+
+        const hash = syncer.hashContent(content);
+        syncer.updateHash(relativePath, hash);
+        processedCount++;
       }
 
       // Update snapshot
@@ -580,11 +779,17 @@ async function startBackgroundSync(
       if (cs2) {
         cs2.fileHashes = syncer.getHashes();
         cs2.lastUpdated = new Date().toISOString();
+        // Recompute stats from DB
+        try {
+          const rowCount = await store.getRowCount(colName);
+          cs2.totalChunks = rowCount;
+        } catch { }
+        cs2.indexedFiles = Object.keys(syncer.getHashes()).length;
       }
       await saveSnapshot(snapshotPath, snapshot);
 
-      if (changed.length > 0 || removed.length > 0) {
-        console.error(`[sync] ${path.basename(codebasePath)}: ${changed.length} changed, ${removed.length} removed`);
+      if (processedCount > 0 || removed.length > 0) {
+        console.error(`[sync] ${path.basename(codebasePath)}: ${processedCount}/${changed.length} changed, ${removed.length} removed`);
       }
     } catch {
       // Codebase might be deleted; skip silently
