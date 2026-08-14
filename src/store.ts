@@ -184,7 +184,7 @@ export class LanceDBStore {
     }
 
     // Fallback: full table rebuild
-    const all = await tbl.toArray();
+    const all = await tbl.query().toArray();
     const filtered = all.filter(
       (r: Record<string, unknown>) => !ids.includes(r.id as string)
     );
@@ -204,8 +204,9 @@ export class LanceDBStore {
 
   /**
    * Delete all chunks belonging to the given relative paths.
-   * Uses LanceDB native row-level delete (SQL predicate) to avoid
-   * the destructive drop+recreate pattern.
+   * Deletes by `id LIKE '<relativePath>:%'` (chunk ids embed the relative
+   * path) because LanceDB's SQL planner cannot reliably match the camelCase
+   * `relativePath` column. Avoids the destructive drop+recreate pattern.
    * Falls back to drop+recreate if native delete is unavailable.
    */
   async deleteByRelativePaths(name: string, relativePaths: string[]): Promise<void> {
@@ -213,15 +214,26 @@ export class LanceDBStore {
     const db = this.ensureConnected();
     const tbl = await db.openTable(name);
 
-    // Try native row-level delete first (LanceDB ^0.17.0 supports it)
+    // Try native row-level delete first.
+    // NOTE: LanceDB's SQL planner cannot reliably match the camelCase
+    // `relativePath` column -- an unquoted reference errors with
+    // "No field named relativepath", while a double-quoted one silently
+    // matches 0 rows. Chunk ids are built as
+    // `${relativePath}:${start}-${end}:${hash}`, so instead of filtering on
+    // relativePath we delete by `id LIKE '<escaped path>:%'`, which is
+    // reliable in @lancedb/lancedb ^0.17.0.
     try {
-      // Escape single quotes and wrap each path in quotes for SQL IN clause
-      const escaped = relativePaths.map((p) => `'${p.replace(/'/g, "''")}'`);
+      // Escape LIKE wildcards (\, %, _) in each path, then match the id prefix
+      const escaped = relativePaths.map((p) => {
+        const likeSafe = p.replace(/[\\%_]/g, (c) => "\\" + c);
+        const quoted = likeSafe.replace(/'/g, "''");
+        return `id LIKE '${quoted}:%' ESCAPE '\\'`;
+      });
       // Batch deletes in chunks to avoid overly long SQL strings
       const BATCH = 200;
       for (let i = 0; i < escaped.length; i += BATCH) {
-        const batch = escaped.slice(i, i + BATCH).join(", ");
-        await tbl.delete(`relativePath IN (${batch})`);
+        const batch = escaped.slice(i, i + BATCH).join(" OR ");
+        await tbl.delete(batch);
       }
       return;
     } catch {
@@ -231,7 +243,7 @@ export class LanceDBStore {
 
     // Fallback: full table rebuild
     const pathSet = new Set(relativePaths);
-    const all = await tbl.toArray();
+    const all = await tbl.query().toArray();
     const filtered = all.filter(
       (r: Record<string, unknown>) => !pathSet.has(r.relativePath as string)
     );
@@ -281,7 +293,7 @@ export class LanceDBStore {
     try {
       const db = this.ensureConnected();
       const tbl = await db.openTable(name);
-      const all = await tbl.toArray();
+      const all = await tbl.query().toArray();
       return [...new Set(all.map((r: Record<string, unknown>) => r.relativePath as string))];
     } catch {
       return [];
