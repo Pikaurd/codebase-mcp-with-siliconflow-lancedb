@@ -111,6 +111,17 @@ describe("CodebaseService", () => {
     });
   });
 
+  it("rejects dual status selectors even when either selector is empty", async () => {
+    const { root, service } = await fixture();
+
+    await expect(service.getStatus({ path: root, jobId: "" })).rejects.toMatchObject({
+      code: "INTERNAL_ERROR",
+    });
+    await expect(service.getStatus({ path: "", jobId: "job-id" })).rejects.toMatchObject({
+      code: "INTERNAL_ERROR",
+    });
+  });
+
   it("returns CODEBASE_NOT_INDEXED instead of touching a missing collection", async () => {
     const { root, service } = await fixture();
 
