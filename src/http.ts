@@ -6,7 +6,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { CodebaseService } from "./app.js";
 import { ServiceError, toMcpError } from "./errors.js";
 import { createMcpServer, withMcpRequestId } from "./mcp.js";
-import type { ServiceConfig } from "./types.js";
+import type { McpError, ServiceConfig, ServiceErrorCode } from "./types.js";
 
 interface McpSession {
   server: ReturnType<typeof createMcpServer>;
@@ -29,6 +29,23 @@ function securityFailure(response: Response, requestId: string, status: 401 | 40
   );
   if (status === 401) response.setHeader("www-authenticate", "Bearer");
   response.status(status).json(error);
+}
+
+function protocolFailure(
+  response: Response,
+  requestId: string,
+  status: number,
+  jsonRpcCode: number,
+  code: ServiceErrorCode,
+  message: string,
+  suggestedAction: string,
+): void {
+  const data: McpError = { code, message, suggestedAction, requestId };
+  response.status(status).json({
+    jsonrpc: "2.0",
+    error: { code: jsonRpcCode, message, data },
+    id: null,
+  });
 }
 
 function correlationId(request: Request): string {
@@ -106,11 +123,15 @@ export function createHttpServer(app: CodebaseService, config: ServiceConfig): S
         return;
       }
       if (requestedSessionId || !isInitializeRequest(request.body)) {
-        response.status(requestedSessionId ? 404 : 400).json({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: "Invalid or missing MCP session" },
-          id: null,
-        });
+        protocolFailure(
+          response,
+          id,
+          requestedSessionId ? 404 : 400,
+          -32000,
+          "SERVICE_UNAVAILABLE",
+          "Invalid or missing MCP session",
+          "Initialize a new MCP session and include its MCP-Session-Id header",
+        );
         return;
       }
 
@@ -140,11 +161,15 @@ export function createHttpServer(app: CodebaseService, config: ServiceConfig): S
     } catch (error) {
       console.error(`[mcp] requestId=${id} request failed`, error);
       if (!response.headersSent) {
-        response.status(500).json({
-          jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal server error", data: { requestId: id } },
-          id: null,
-        });
+        protocolFailure(
+          response,
+          id,
+          500,
+          -32603,
+          "INTERNAL_ERROR",
+          "Internal server error",
+          "Retry the request or check service logs with the request ID",
+        );
       }
     }
   });
@@ -154,11 +179,15 @@ export function createHttpServer(app: CodebaseService, config: ServiceConfig): S
     const requestedSessionId = requestSessionId(request);
     const session = requestedSessionId ? sessions.get(requestedSessionId) : undefined;
     if (!session) {
-      response.status(404).json({
-        jsonrpc: "2.0",
-        error: { code: -32000, message: "Invalid or missing MCP session" },
-        id: null,
-      });
+      protocolFailure(
+        response,
+        id,
+        404,
+        -32000,
+        "SERVICE_UNAVAILABLE",
+        "Invalid or missing MCP session",
+        "Initialize a new MCP session and include its MCP-Session-Id header",
+      );
       return;
     }
     try {
@@ -166,26 +195,46 @@ export function createHttpServer(app: CodebaseService, config: ServiceConfig): S
     } catch (error) {
       console.error(`[mcp] requestId=${id} session request failed`, error);
       if (!response.headersSent) {
-        response.status(500).json({
-          jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal server error", data: { requestId: id } },
-          id: null,
-        });
+        protocolFailure(
+          response,
+          id,
+          500,
+          -32603,
+          "INTERNAL_ERROR",
+          "Internal server error",
+          "Retry the request or check service logs with the request ID",
+        );
       }
     }
   };
   web.get("/mcp", handleExistingSession);
   web.delete("/mcp", handleExistingSession);
 
+  web.use((request, response) => {
+    protocolFailure(
+      response,
+      correlationId(request),
+      404,
+      -32600,
+      "INTERNAL_ERROR",
+      "HTTP endpoint not found",
+      "Use /healthz for health checks or /mcp for MCP requests",
+    );
+  });
+
   web.use((_error: unknown, request: Request, response: Response, _next: NextFunction) => {
     const id = correlationId(request);
     console.error(`[http] requestId=${id} invalid JSON`);
     if (!response.headersSent) {
-      response.status(400).json({
-        jsonrpc: "2.0",
-        error: { code: -32700, message: "Invalid JSON", data: { requestId: id } },
-        id: null,
-      });
+      protocolFailure(
+        response,
+        id,
+        400,
+        -32700,
+        "INTERNAL_ERROR",
+        "Invalid JSON",
+        "Send a valid JSON request body",
+      );
     }
   });
 

@@ -70,7 +70,7 @@ Header:  Authorization: Bearer <LOCAL_AUTH_TOKEN>
 For example, an authenticated initialization request is:
 
 ```bash
-curl -sS http://127.0.0.1:3000/mcp \
+curl -sS -i http://127.0.0.1:3000/mcp \
   -X POST \
   -H "Authorization: Bearer $LOCAL_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
@@ -79,6 +79,7 @@ curl -sS http://127.0.0.1:3000/mcp \
 ```
 
 Save the returned `mcp-session-id` and include it with subsequent MCP requests.
+For example, subsequent requests add `-H "MCP-Session-Id: <returned-session-id>"`.
 The service accepts only loopback requests whose `Host` (and, when supplied,
 `Origin`) matches its local address.
 

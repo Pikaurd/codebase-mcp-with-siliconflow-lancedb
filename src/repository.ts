@@ -217,6 +217,25 @@ export class MetadataRepository {
         failure?.message ?? null,
         id,
       );
+      if (state === "completed" && current.kind !== "clear") {
+        this.db.prepare(
+          `UPDATE codebases
+           SET index_status = 'indexed',
+               indexed_files = (SELECT COUNT(*) FROM file_hashes WHERE codebase_path = ?),
+               total_chunks = ?,
+               latest_completed_job_id = ?,
+               updated_at = ?
+           WHERE path = ?`,
+        ).run(
+          current.path,
+          update.statistics?.totalChunks ?? current.totalChunks,
+          id,
+          updatedAt,
+          current.path,
+        );
+      } else if (state === "interrupted" && current.state === "running") {
+        this.reconcileInterruptedCodebase(current.path, id, updatedAt);
+      }
       return this.getJob(id)!;
     });
     return transition();
@@ -317,6 +336,12 @@ export class MetadataRepository {
   markRunningJobsInterrupted(): void {
     const interruptedAt = now();
     this.db.transaction(() => {
+      const running = this.db.prepare(
+        "SELECT id, path FROM index_jobs WHERE state = 'running'",
+      ).all() as Array<{ id: string; path: string }>;
+      for (const job of running) {
+        this.reconcileInterruptedCodebase(job.path, job.id, interruptedAt);
+      }
       this.db.prepare(
         `UPDATE index_jobs
          SET state = 'interrupted', updated_at = ?, completed_at = ?
@@ -328,6 +353,12 @@ export class MetadataRepository {
   markActiveJobsInterrupted(): void {
     const interruptedAt = now();
     this.db.transaction(() => {
+      const running = this.db.prepare(
+        "SELECT id, path FROM index_jobs WHERE state = 'running'",
+      ).all() as Array<{ id: string; path: string }>;
+      for (const job of running) {
+        this.reconcileInterruptedCodebase(job.path, job.id, interruptedAt);
+      }
       this.db.prepare(
         `UPDATE index_jobs
          SET state = 'interrupted', updated_at = ?, completed_at = ?
@@ -341,6 +372,27 @@ export class MetadataRepository {
       this.db.prepare("DELETE FROM file_hashes WHERE codebase_path = ?").run(path);
       this.db.prepare("DELETE FROM codebases WHERE path = ?").run(path);
     })();
+  }
+
+  private reconcileInterruptedCodebase(
+    path: string,
+    interruptedJobId: string,
+    updatedAt: string,
+  ): void {
+    this.db.prepare(
+      `UPDATE codebases
+       SET index_status = CASE
+             WHEN latest_completed_job_id IS NOT NULL AND latest_completed_job_id <> ?
+               THEN 'indexed'
+             ELSE 'failed'
+           END,
+           latest_completed_job_id = CASE
+             WHEN latest_completed_job_id = ? THEN NULL
+             ELSE latest_completed_job_id
+           END,
+           updated_at = ?
+       WHERE path = ? AND (index_status = 'indexing' OR latest_completed_job_id = ?)`,
+    ).run(interruptedJobId, interruptedJobId, updatedAt, path, interruptedJobId);
   }
 
   private migrate(): void {

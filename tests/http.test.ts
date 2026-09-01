@@ -328,12 +328,44 @@ describe("local Streamable HTTP MCP", () => {
     expect(response.status).toBe(400);
     expect(body).toMatchObject({
       jsonrpc: "2.0",
-      error: { code: -32700, data: { requestId: expect.any(String) } },
+      error: {
+        code: -32700,
+        data: {
+          code: "INTERNAL_ERROR",
+          requestId: expect.any(String),
+          suggestedAction: expect.any(String),
+        },
+      },
     });
     expect(logs).toMatch(/requestId=.*invalid JSON/);
     expect(logs).not.toContain(SECRET);
     expect(logs).not.toContain(secretBody);
     expect(errorLog.mock.calls.every((call) => call.length === 1)).toBe(true);
+  });
+
+  it("returns the stable public error contract for an invalid MCP session", async () => {
+    const { baseUrl } = await start();
+
+    const response = await postJson(
+      baseUrl,
+      { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+      { ...mcpHeaders(), "mcp-session-id": "missing-session" },
+    );
+    const body = await responseBody(response);
+
+    expect(response.status).toBe(404);
+    expect(body).toMatchObject({
+      jsonrpc: "2.0",
+      error: {
+        code: -32000,
+        data: {
+          code: "SERVICE_UNAVAILABLE",
+          requestId: expect.any(String),
+          suggestedAction: expect.any(String),
+        },
+      },
+    });
+    expect(response.headers.get("x-request-id")).toBe(body.error.data.requestId);
   });
 
   it("discovers the four shared codebase tools with a valid token", async () => {

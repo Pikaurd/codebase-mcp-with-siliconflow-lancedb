@@ -439,7 +439,7 @@ describe("LanceDBStore file replacement", () => {
     await fs.rm(TMP_DIR, { recursive: true, force: true });
   });
 
-  it("retains old chunks when every attempted replacement insert fails", async () => {
+  it("retains old chunks when the atomic replacement fails before commit", async () => {
     const store = new LanceDBStore(path.join(TMP_DIR, "lance"));
     await store.connect();
     const oldDocument = {
@@ -454,17 +454,128 @@ describe("LanceDBStore file replacement", () => {
       codebasePath: "/repo",
     };
     await store.insert("collection", [oldDocument]);
-    vi.spyOn(store, "insert").mockRejectedValue(new Error("controlled insert failure"));
+    const connection = Reflect.get(store, "db");
+    const table = await connection.openTable("collection");
+    const merge = {
+      whenMatchedUpdateAll: () => merge,
+      whenNotMatchedInsertAll: () => merge,
+      whenNotMatchedBySourceDelete: () => merge,
+      execute: vi.fn().mockRejectedValue(new Error("controlled merge failure")),
+    };
+    vi.spyOn(connection, "openTable").mockResolvedValue(table);
+    vi.spyOn(table, "mergeInsert").mockReturnValue(merge);
 
     await expect(store.replaceByRelativePath("collection", "src/a.ts", [{
       ...oldDocument,
       id: "src/a.ts:1-1:new",
       text: "export const replacement = 999;",
-    }])).rejects.toThrow("controlled insert failure");
+    }])).rejects.toThrow("controlled merge failure");
 
     const results = await store.search("collection", [1, 0, 0], "original", 10);
     expect(results.map(({ text }) => text)).toContain("export const original = 1;");
     expect(results.map(({ text }) => text).join("\n")).not.toContain("replacement = 999");
+  });
+
+  it("never exposes a mixed set when a committed replacement reports failure", async () => {
+    const store = new LanceDBStore(path.join(TMP_DIR, "partial-lance"));
+    await store.connect();
+    const oldDocument = {
+      id: "src/a.ts:1-1:old",
+      relativePath: "src/a.ts",
+      vector: [1, 0, 0],
+      text: "export const original = 1;",
+      startLine: 1,
+      endLine: 1,
+      fileExtension: ".ts",
+      metadata: JSON.stringify({ language: "typescript" }),
+      codebasePath: "/repo",
+    };
+    const firstReplacement = {
+      ...oldDocument,
+      id: "src/a.ts:1-1:new-one",
+      text: "export const replacementOne = 1;",
+    };
+    const secondReplacement = {
+      ...oldDocument,
+      id: "src/a.ts:2-2:new-two",
+      text: "export const replacementTwo = 2;",
+      startLine: 2,
+      endLine: 2,
+    };
+    await store.insert("collection", [oldDocument]);
+    const connection = Reflect.get(store, "db");
+    const table = await connection.openTable("collection");
+    const committedMerge = table
+      .mergeInsert("id")
+      .whenMatchedUpdateAll()
+      .whenNotMatchedInsertAll()
+      .whenNotMatchedBySourceDelete({ where: "id LIKE 'src/a.ts:%'" });
+    const merge = {
+      whenMatchedUpdateAll: () => merge,
+      whenNotMatchedInsertAll: () => merge,
+      whenNotMatchedBySourceDelete: () => merge,
+      execute: vi.fn().mockImplementation(async (documents) => {
+        await committedMerge.execute(documents);
+        throw new Error("controlled post-commit failure");
+      }),
+    };
+    vi.spyOn(connection, "openTable").mockResolvedValue(table);
+    vi.spyOn(table, "mergeInsert").mockReturnValue(merge);
+
+    await expect(store.replaceByRelativePath(
+      "collection",
+      "src/a.ts",
+      [firstReplacement, secondReplacement],
+    )).rejects.toThrow("controlled post-commit failure");
+
+    const rows = await Reflect.get(store, "documentsByRelativePath").call(
+      store,
+      "collection",
+      "src/a.ts",
+    );
+    expect(rows.map(({ id }: { id: string }) => id).sort()).toEqual([
+      firstReplacement.id,
+      secondReplacement.id,
+    ].sort());
+  });
+
+  it("commits all replacement chunks while removing every superseded chunk", async () => {
+    const store = new LanceDBStore(path.join(TMP_DIR, "replacement-delete-lance"));
+    await store.connect();
+    const oldDocument = {
+      id: "src/a.ts:1-1:old",
+      relativePath: "src/a.ts",
+      vector: [1, 0, 0],
+      text: "export const original = 1;",
+      startLine: 1,
+      endLine: 1,
+      fileExtension: ".ts",
+      metadata: JSON.stringify({ language: "typescript" }),
+      codebasePath: "/repo",
+    };
+    await store.insert("collection", [oldDocument]);
+    const replacements = [{
+      ...oldDocument,
+      id: "src/a.ts:1-1:new-one",
+      text: "export const replacementOne = 1;",
+    }, {
+      ...oldDocument,
+      id: "src/a.ts:2-2:new-two",
+      text: "export const replacementTwo = 2;",
+      startLine: 2,
+      endLine: 2,
+    }];
+
+    await store.replaceByRelativePath("collection", "src/a.ts", replacements);
+
+    const rows = await Reflect.get(store, "documentsByRelativePath").call(
+      store,
+      "collection",
+      "src/a.ts",
+    );
+    expect(rows.map(({ id }: { id: string }) => id).sort()).toEqual(
+      replacements.map(({ id }) => id).sort(),
+    );
   });
 
   it("creates a missing collection when replacing a new file", async () => {

@@ -86,17 +86,7 @@ export class LanceDBStore {
     const db = this.ensureConnected();
     if (documents.length === 0) return;
 
-    const records = documents.map((doc) => ({
-      id: doc.id,
-      vector: doc.vector,
-      text: doc.text,
-      relativePath: doc.relativePath,
-      startLine: doc.startLine,
-      endLine: doc.endLine,
-      fileExtension: doc.fileExtension,
-      metadata: doc.metadata,
-      codebasePath: doc.codebasePath,
-    }));
+    const records = this.recordsFor(documents);
 
     const exists = await this.hasTable(name);
     if (exists) {
@@ -120,20 +110,42 @@ export class LanceDBStore {
     relativePath: string,
     documents: Document[],
   ): Promise<void> {
-    if (!(await this.hasTable(name))) {
+    const db = this.ensureConnected();
+    if (!(await db.tableNames()).includes(name)) {
       await this.insert(name, documents);
       return;
     }
-    const previous = await this.documentsByRelativePath(name, relativePath);
-    // Write-ahead commit: old IDs remain durable until every target ID exists.
-    const existingIds = new Set(previous.map(({ id }) => id));
-    const targetIds = new Set(documents.map(({ id }) => id));
-    const missingDocuments = documents.filter(({ id }) => !existingIds.has(id));
-    await this.insert(name, missingDocuments);
-    await this.deleteByIds(
-      name,
-      previous.filter(({ id }) => !targetIds.has(id)).map(({ id }) => id),
-    );
+    const table = await db.openTable(name);
+    if (documents.length === 0) {
+      await table.delete(this.idPrefixFilter(relativePath));
+      return;
+    }
+    await table
+      .mergeInsert("id")
+      .whenMatchedUpdateAll()
+      .whenNotMatchedInsertAll()
+      .whenNotMatchedBySourceDelete({ where: this.idPrefixFilter(relativePath) })
+      .execute(this.recordsFor(documents) as lancedb.Data);
+  }
+
+  private recordsFor(documents: Document[]): Array<Record<string, unknown>> {
+    return documents.map((doc) => ({
+      id: doc.id,
+      vector: doc.vector,
+      text: doc.text,
+      relativePath: doc.relativePath,
+      startLine: doc.startLine,
+      endLine: doc.endLine,
+      fileExtension: doc.fileExtension,
+      metadata: doc.metadata,
+      codebasePath: doc.codebasePath,
+    }));
+  }
+
+  private idPrefixFilter(relativePath: string, column = "id"): string {
+    const likeSafe = relativePath.replace(/[\\%_]/g, (character) => `\\${character}`);
+    const quoted = likeSafe.replace(/'/g, "''");
+    return `${column} LIKE '${quoted}:%' ESCAPE '\\'`;
   }
 
   private async documentsByRelativePath(name: string, relativePath: string): Promise<Document[]> {

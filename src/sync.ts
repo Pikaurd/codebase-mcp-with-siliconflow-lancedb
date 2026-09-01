@@ -69,6 +69,7 @@ const DEFAULT_IGNORE_PATTERNS = [
 
 export class FileSynchronizer {
   private codebasePath: string;
+  private canonicalCodebasePath?: Promise<string>;
   private hashes: Map<string, string> = new Map();
   private ig: ReturnType<typeof ignore>;
 
@@ -83,19 +84,13 @@ export class FileSynchronizer {
   async loadIgnoreFiles(): Promise<void> {
     // Load .gitignore
     try {
-      const gitignore = await fs.readFile(
-        path.join(this.codebasePath, ".gitignore"),
-        "utf-8"
-      );
+      const gitignore = await this.readFile(path.join(this.codebasePath, ".gitignore"));
       this.ig.add(gitignore);
     } catch {}
 
     // Load .contextignore
     try {
-      const contextignore = await fs.readFile(
-        path.join(this.codebasePath, ".contextignore"),
-        "utf-8"
-      );
+      const contextignore = await this.readFile(path.join(this.codebasePath, ".contextignore"));
       this.ig.add(contextignore);
     } catch {}
 
@@ -112,7 +107,8 @@ export class FileSynchronizer {
 
   async discoverFiles(): Promise<string[]> {
     const allFiles: string[] = [];
-    await this.walkDir(this.codebasePath, allFiles);
+    const canonicalRoot = await this.getCanonicalCodebasePath();
+    await this.walkDir(this.codebasePath, canonicalRoot, new Set(), allFiles);
     return allFiles.filter((f) => {
       const ext = path.extname(f).toLowerCase();
       return SUPPORTED_EXTENSIONS.has(ext);
@@ -129,7 +125,12 @@ export class FileSynchronizer {
     }
   }
 
-  private async walkGitRepo(dir: string, result: string[]): Promise<void> {
+  private async walkGitRepo(
+    dir: string,
+    canonicalRoot: string,
+    visitedDirectories: Set<string>,
+    result: string[],
+  ): Promise<void> {
     try {
       const output = execSync(
         "git ls-files --cached --others --exclude-standard",
@@ -138,25 +139,45 @@ export class FileSynchronizer {
       for (const line of output.split("\n")) {
         const relativePath = line.trim();
         if (!relativePath) continue;
-        result.push(path.join(dir, relativePath));
+        await this.addDiscoveredFile(path.join(dir, relativePath), canonicalRoot, result);
       }
     } catch {
       // git failed, fallback to walk + ignore
-      await this.walkDirFallback(dir, result);
+      await this.walkDirFallback(dir, canonicalRoot, visitedDirectories, result, true);
     }
   }
 
-  private async walkDir(dir: string, result: string[]): Promise<void> {
+  private async walkDir(
+    dir: string,
+    canonicalRoot: string,
+    visitedDirectories: Set<string>,
+    result: string[],
+  ): Promise<void> {
+    const canonicalDirectory = await this.realPathWithinRoot(dir, canonicalRoot);
+    if (!canonicalDirectory || visitedDirectories.has(canonicalDirectory)) return;
+    visitedDirectories.add(canonicalDirectory);
     // Nested git repo (submodule): use git ls-files so its own .gitignore is respected
     // The root directory (codebasePath) is already covered by loadIgnoreFiles, so skip git ls-files there
     if (dir !== this.codebasePath && (await this.isGitRepo(dir))) {
-      await this.walkGitRepo(dir, result);
+      await this.walkGitRepo(dir, canonicalRoot, visitedDirectories, result);
       return;
     }
-    await this.walkDirFallback(dir, result);
+    await this.walkDirFallback(dir, canonicalRoot, visitedDirectories, result, true);
   }
 
-  private async walkDirFallback(dir: string, result: string[]): Promise<void> {
+  private async walkDirFallback(
+    dir: string,
+    canonicalRoot: string,
+    visitedDirectories: Set<string>,
+    result: string[],
+    alreadyVisited = false,
+  ): Promise<void> {
+    const canonicalDirectory = await this.realPathWithinRoot(dir, canonicalRoot);
+    if (!canonicalDirectory) return;
+    if (!alreadyVisited) {
+      if (visitedDirectories.has(canonicalDirectory)) return;
+      visitedDirectories.add(canonicalDirectory);
+    }
     let entries;
     try {
       entries = await fs.readdir(dir, { withFileTypes: true });
@@ -173,9 +194,11 @@ export class FileSynchronizer {
       if (entry.isDirectory() || entry.isSymbolicLink()) {
         // Resolve symlink to check if it points to a directory
         try {
+          const canonicalTarget = await this.realPathWithinRoot(fullPath, canonicalRoot);
+          if (!canonicalTarget) continue;
           const stat = await fs.stat(fullPath);
           if (stat.isDirectory()) {
-            await this.walkDir(fullPath, result);
+            await this.walkDir(fullPath, canonicalRoot, visitedDirectories, result);
           } else if (stat.isFile()) {
             result.push(fullPath);
           }
@@ -183,8 +206,46 @@ export class FileSynchronizer {
           // broken symlink, skip
         }
       } else if (entry.isFile()) {
-        result.push(fullPath);
+        await this.addDiscoveredFile(fullPath, canonicalRoot, result);
       }
+    }
+  }
+
+  private async getCanonicalCodebasePath(): Promise<string> {
+    this.canonicalCodebasePath ??= fs.realpath(this.codebasePath);
+    return this.canonicalCodebasePath;
+  }
+
+  private async realPathWithinRoot(
+    candidate: string,
+    canonicalRoot: string,
+  ): Promise<string | undefined> {
+    try {
+      const canonicalTarget = await fs.realpath(candidate);
+      const relative = path.relative(canonicalRoot, canonicalTarget);
+      if (
+        relative === ""
+        || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+      ) {
+        return canonicalTarget;
+      }
+    } catch {
+      // Missing and broken targets are not discoverable.
+    }
+    return undefined;
+  }
+
+  private async addDiscoveredFile(
+    filePath: string,
+    canonicalRoot: string,
+    result: string[],
+  ): Promise<void> {
+    const canonicalTarget = await this.realPathWithinRoot(filePath, canonicalRoot);
+    if (!canonicalTarget) return;
+    try {
+      if ((await fs.stat(canonicalTarget)).isFile()) result.push(filePath);
+    } catch {
+      // The file changed between discovery checks; retry on the next sync.
     }
   }
 
@@ -193,7 +254,7 @@ export class FileSynchronizer {
   }
 
   async computeFileHash(filePath: string): Promise<string> {
-    const content = await fs.readFile(filePath, "utf-8");
+    const content = await this.readFile(filePath);
     return this.hashContent(content);
   }
 
@@ -254,6 +315,10 @@ export class FileSynchronizer {
   }
 
   async readFile(filePath: string): Promise<string> {
+    const canonicalRoot = await this.getCanonicalCodebasePath();
+    if (!(await this.realPathWithinRoot(filePath, canonicalRoot))) {
+      throw new Error("Refusing to read a file outside the codebase root");
+    }
     return fs.readFile(filePath, "utf-8");
   }
 

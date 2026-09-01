@@ -117,6 +117,28 @@ describe("MetadataRepository", () => {
     expect(reopened.getJob("job-1")?.state).toBe("interrupted");
   });
 
+  it("clears an interrupted job mistakenly recorded as the completed codebase version", () => {
+    const repository = MetadataRepository.open(createDatabasePath());
+    repository.createJob({ id: "job-1", path: "/repo", kind: "index", options: "{}" });
+    repository.transitionJob("job-1", "running");
+    repository.upsertCodebase({
+      path: "/repo",
+      collectionName: "repo_collection",
+      status: "indexed",
+      indexedFiles: 1,
+      totalChunks: 1,
+      latestCompletedJobId: "job-1",
+    });
+
+    repository.markRunningJobsInterrupted();
+
+    expect(repository.getJob("job-1")?.state).toBe("interrupted");
+    expect(repository.getCodebase("/repo")).toMatchObject({
+      status: "failed",
+      latestCompletedJobId: undefined,
+    });
+  });
+
   it("persists job statistics and sanitized failure details", () => {
     const dbPath = createDatabasePath();
     const first = MetadataRepository.open(dbPath);

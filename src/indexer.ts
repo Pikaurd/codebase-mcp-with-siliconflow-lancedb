@@ -176,6 +176,7 @@ export class Indexer {
     let processedFiles = 0;
     let totalChunks = previous?.totalChunks ?? 0;
 
+    this.ensureJobRunning(completedJobId);
     repository.upsertCodebase({
       path: codebasePath,
       collectionName,
@@ -202,10 +203,12 @@ export class Indexer {
 
       for (const relativePath of removed) {
         try {
+          this.ensureJobRunning(completedJobId);
           await this.access.write(
             codebasePath,
             () => store.deleteByRelativePaths(collectionName, [relativePath]),
           );
+          this.ensureJobRunning(completedJobId);
           synchronizer.removeHash(relativePath);
           repository.replaceFileHashes(codebasePath, synchronizer.getHashes());
           totalChunks = Math.max(0, await store.getRowCount(collectionName));
@@ -224,10 +227,12 @@ export class Indexer {
           const embeddings = await embedding.embed(chunks.map((chunk) => chunk.content));
           const documents = toDocuments(chunks, embeddings, codebasePath);
 
+          this.ensureJobRunning(completedJobId);
           await this.access.write(
             codebasePath,
             () => store.replaceByRelativePath(collectionName, relativePath, documents),
           );
+          this.ensureJobRunning(completedJobId);
           synchronizer.updateHash(relativePath, synchronizer.hashContent(content));
           repository.replaceFileHashes(codebasePath, synchronizer.getHashes());
           processedFiles += 1;
@@ -247,24 +252,29 @@ export class Indexer {
         );
       }
 
-      repository.upsertCodebase({
-        path: codebasePath,
-        collectionName,
-        status: "indexed",
-        indexedFiles: Object.keys(synchronizer.getHashes()).length,
-        totalChunks,
-        latestCompletedJobId: completedJobId ?? previous?.latestCompletedJobId,
-      });
+      this.ensureJobRunning(completedJobId);
+      if (completedJobId === undefined) {
+        repository.upsertCodebase({
+          path: codebasePath,
+          collectionName,
+          status: "indexed",
+          indexedFiles: Object.keys(synchronizer.getHashes()).length,
+          totalChunks,
+          latestCompletedJobId: previous?.latestCompletedJobId,
+        });
+      }
       return { processedFiles, totalChunks };
     } catch (error) {
-      repository.upsertCodebase({
-        path: codebasePath,
-        collectionName,
-        status: "failed",
-        indexedFiles: Object.keys(synchronizer.getHashes()).length,
-        totalChunks,
-        latestCompletedJobId: previous?.latestCompletedJobId,
-      });
+      if (completedJobId === undefined || repository.getJob(completedJobId)?.state === "running") {
+        repository.upsertCodebase({
+          path: codebasePath,
+          collectionName,
+          status: "failed",
+          indexedFiles: Object.keys(synchronizer.getHashes()).length,
+          totalChunks,
+          latestCompletedJobId: previous?.latestCompletedJobId,
+        });
+      }
       throw error instanceof ServiceError
         ? error
         : new ServiceError(
@@ -282,5 +292,14 @@ export class Indexer {
       this.dependencies.repository.deleteCodebase(codebasePath);
     });
     return { processedFiles: 0, totalChunks: 0 };
+  }
+
+  private ensureJobRunning(jobId: string | undefined): void {
+    if (jobId === undefined || this.dependencies.repository.getJob(jobId)?.state === "running") return;
+    throw new ServiceError(
+      "SERVICE_UNAVAILABLE",
+      "The indexing job was interrupted",
+      "Submit a new indexing job after the service restarts",
+    );
   }
 }

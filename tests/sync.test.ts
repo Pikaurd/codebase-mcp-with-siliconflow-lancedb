@@ -17,9 +17,26 @@ async function ensureDir(dir: string) {
 describe("FileSynchronizer", () => {
   afterEach(async () => {
     await fs.rm(TMP_DIR, { recursive: true, force: true });
+    await fs.rm(`${TMP_DIR}-outside`, { recursive: true, force: true });
   });
 
   describe("discoverFiles", () => {
+    it("does not discover or read files through symlinks outside the codebase root", async () => {
+      const outside = `${TMP_DIR}-outside`;
+      await writeFile(path.join(TMP_DIR, "src", "inside.ts"), "export const inside = true;");
+      await writeFile(path.join(outside, "secret.ts"), "export const secret = true;");
+      await fs.symlink(path.join(outside, "secret.ts"), path.join(TMP_DIR, "src", "secret.ts"));
+      await fs.symlink(outside, path.join(TMP_DIR, "linked-outside"));
+
+      const syncer = new FileSynchronizer(TMP_DIR);
+
+      expect(await syncer.discoverFiles()).toEqual([path.join(TMP_DIR, "src", "inside.ts")]);
+      await expect(syncer.readFile(path.join(TMP_DIR, "src", "secret.ts"))).rejects.toThrow(
+        /outside the codebase root/,
+      );
+
+    });
+
     it("respects .gitignore when discovering files in root repo", async () => {
       await ensureDir(TMP_DIR);
 
@@ -67,6 +84,7 @@ describe("FileSynchronizer", () => {
   describe("submodule support", () => {
     it("uses git ls-files for nested git repos (submodules)", async () => {
       const subDir = path.join(TMP_DIR, "submodule");
+      const outside = `${TMP_DIR}-outside`;
       await ensureDir(subDir);
 
       const { execSync } = await import("child_process");
@@ -79,6 +97,8 @@ describe("FileSynchronizer", () => {
       // Build artifacts in submodule (should be excluded by its .gitignore)
       await writeFile(path.join(subDir, "build", "out.js"), `// out`);
       await writeFile(path.join(subDir, ".gitignore"), "/build/\n");
+      await writeFile(path.join(outside, "secret.ts"), "export const secret = true;");
+      await fs.symlink(path.join(outside, "secret.ts"), path.join(subDir, "secret.ts"));
 
       execSync("git add -A", { cwd: subDir });
       execSync("git commit -m init --allow-empty", { cwd: subDir });
@@ -94,6 +114,7 @@ describe("FileSynchronizer", () => {
       expect(files).toContain(rootFile);
       expect(files).toContain(subFile);
       expect(files).not.toContain(buildFile);
+      expect(files).not.toContain(path.join(subDir, "secret.ts"));
     });
   });
 
