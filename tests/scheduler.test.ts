@@ -5,13 +5,18 @@ import * as path from "node:path";
 import type { IndexJob } from "../src/repository.js";
 import { MetadataRepository } from "../src/repository.js";
 import { IndexJobScheduler } from "../src/scheduler.js";
+import { loadConfig } from "../src/config.js";
 
 const temporaryDirectories: string[] = [];
 
-function createRepository(): MetadataRepository {
+function createDatabasePath(): string {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "codebase-mcp-scheduler-"));
   temporaryDirectories.push(directory);
-  return MetadataRepository.open(path.join(directory, "metadata.sqlite"));
+  return path.join(directory, "metadata.sqlite");
+}
+
+function createRepository(): MetadataRepository {
+  return MetadataRepository.open(createDatabasePath());
 }
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -29,6 +34,41 @@ afterEach(() => {
 });
 
 describe("IndexJobScheduler", () => {
+  it("reconciles persisted running and queued jobs so a restart can enqueue equivalent work", async () => {
+    const databasePath = createDatabasePath();
+    const beforeRestart = MetadataRepository.open(databasePath);
+    beforeRestart.createJob({
+      id: "running-job",
+      path: "/canonical/running",
+      kind: "index",
+      options: "{}",
+    });
+    beforeRestart.transitionJob("running-job", "running");
+    beforeRestart.createJob({
+      id: "queued-job",
+      path: "/canonical/queued",
+      kind: "index",
+      options: "{}",
+    });
+    const repository = MetadataRepository.open(databasePath);
+    const started: string[] = [];
+
+    const scheduler = new IndexJobScheduler(repository, async (job) => {
+      started.push(job.id);
+    });
+
+    expect(repository.getJob("running-job")?.state).toBe("interrupted");
+    expect(repository.getJob("queued-job")?.state).toBe("interrupted");
+
+    const replacement = scheduler.enqueue({
+      path: "/canonical/queued",
+      kind: "index",
+      options: {},
+    });
+    expect(replacement).toMatchObject({ reused: false, state: "queued" });
+    await vi.waitFor(() => expect(started).toEqual([replacement.jobId]));
+  });
+
   it("reuses one active index job for two clients targeting the same path", async () => {
     const repository = createRepository();
     const execution = deferred();
@@ -114,5 +154,35 @@ describe("IndexJobScheduler", () => {
     await vi.waitFor(() => expect(repository.getJob(first.jobId)?.state).toBe("completed"));
     await vi.waitFor(() => expect(repository.getJob(second.jobId)?.state).toBe("completed"));
     await vi.waitFor(() => expect(repository.getJob(third.jobId)?.state).toBe("completed"));
+  });
+
+  it("uses the configured concurrency limit when composed from ServiceConfig", async () => {
+    const repository = createRepository();
+    const executions: Array<{ job: IndexJob; complete: () => void }> = [];
+    const scheduler = IndexJobScheduler.fromConfig(
+      repository,
+      loadConfig({
+        LOCAL_AUTH_TOKEN: "local-token",
+        CODEBASE_MCP_ALLOWED_ROOTS: os.tmpdir(),
+        INDEX_MAX_CONCURRENCY: "1",
+      }),
+      async (job) => {
+        const gate = deferred();
+        executions.push({ job, complete: gate.resolve });
+        await gate.promise;
+      },
+    );
+
+    const first = scheduler.enqueue({ path: "/canonical/one", kind: "index", options: {} });
+    const second = scheduler.enqueue({ path: "/canonical/two", kind: "index", options: {} });
+
+    await vi.waitFor(() => expect(executions).toHaveLength(1));
+    expect(executions[0].job.id).toBe(first.jobId);
+    expect(repository.getJob(second.jobId)?.state).toBe("queued");
+
+    executions[0].complete();
+    await vi.waitFor(() => expect(executions).toHaveLength(2));
+    expect(executions[1].job.id).toBe(second.jobId);
+    executions[1].complete();
   });
 });

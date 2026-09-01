@@ -275,6 +275,17 @@ export class MetadataRepository {
     })();
   }
 
+  markActiveJobsInterrupted(): void {
+    const interruptedAt = now();
+    this.db.transaction(() => {
+      this.db.prepare(
+        `UPDATE index_jobs
+         SET state = 'interrupted', updated_at = ?, completed_at = ?
+         WHERE state IN ('queued', 'running')`,
+      ).run(interruptedAt, interruptedAt);
+    })();
+  }
+
   deleteCodebase(path: string): void {
     this.db.transaction(() => {
       this.db.prepare("DELETE FROM file_hashes WHERE codebase_path = ?").run(path);

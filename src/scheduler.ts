@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ServiceError } from "./errors.js";
+import type { ServiceConfig } from "./types.js";
 import type {
   IndexJob,
   IndexJobKind,
@@ -46,6 +47,15 @@ export class IndexJobScheduler {
         "Configure a positive scheduler concurrency limit",
       );
     }
+    this.repository.markActiveJobsInterrupted();
+  }
+
+  static fromConfig(
+    repository: MetadataRepository,
+    config: ServiceConfig,
+    executeJob: IndexJobExecutor = async () => undefined,
+  ): IndexJobScheduler {
+    return new IndexJobScheduler(repository, executeJob, config.indexMaxConcurrency);
   }
 
   enqueue(request: EnqueueRequest): EnqueueResult {

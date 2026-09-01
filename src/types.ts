@@ -63,6 +63,7 @@ export interface ServiceConfig {
   port: number;
   localAuthToken: string;
   allowedRoots: string[];
+  indexMaxConcurrency: number;
   openaiApiKey?: string;
   openaiBaseUrl?: string;
   embeddingModel?: string;
