@@ -57,3 +57,31 @@ export interface EmbeddingResult {
   vector: number[];
   dimension: number;
 }
+
+export interface ServiceConfig {
+  host: string;
+  port: number;
+  localAuthToken: string;
+  allowedRoots: string[];
+  openaiApiKey?: string;
+  openaiBaseUrl?: string;
+  embeddingModel?: string;
+}
+
+export type ServiceErrorCode =
+  | "UNAUTHORIZED"
+  | "PATH_NOT_ALLOWED"
+  | "PATH_NOT_FOUND"
+  | "CODEBASE_NOT_INDEXED"
+  | "JOB_REUSED"
+  | "JOB_QUEUED"
+  | "INDEX_FAILED"
+  | "SERVICE_UNAVAILABLE"
+  | "INTERNAL_ERROR";
+
+export interface McpError {
+  code: ServiceErrorCode;
+  message: string;
+  suggestedAction: string;
+  requestId: string;
+}
