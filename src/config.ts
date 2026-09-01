@@ -31,9 +31,17 @@ function configuredPort(value: string | undefined): number {
   return port;
 }
 
+function configuredHost(value: string | undefined): string {
+  const host = value?.trim() || DEFAULT_HOST;
+  if (host !== DEFAULT_HOST) {
+    throw new Error("HOST must be 127.0.0.1 for local-only service binding");
+  }
+  return host;
+}
+
 export function loadConfig(env: Environment = process.env): ServiceConfig {
   return {
-    host: env.HOST?.trim() || DEFAULT_HOST,
+    host: configuredHost(env.HOST),
     port: configuredPort(env.PORT),
     localAuthToken: required(env, "LOCAL_AUTH_TOKEN"),
     allowedRoots: configuredRoots(required(env, "CODEBASE_MCP_ALLOWED_ROOTS")),
