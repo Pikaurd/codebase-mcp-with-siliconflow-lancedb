@@ -125,14 +125,15 @@ export class LanceDBStore {
       return;
     }
     const previous = await this.documentsByRelativePath(name, relativePath);
-    await this.deleteByRelativePaths(name, [relativePath]);
-    try {
-      await this.insert(name, documents);
-    } catch (error) {
-      await this.deleteByRelativePaths(name, [relativePath]);
-      await this.insert(name, previous);
-      throw error;
-    }
+    // Write-ahead commit: old IDs remain durable until every target ID exists.
+    const existingIds = new Set(previous.map(({ id }) => id));
+    const targetIds = new Set(documents.map(({ id }) => id));
+    const missingDocuments = documents.filter(({ id }) => !existingIds.has(id));
+    await this.insert(name, missingDocuments);
+    await this.deleteByIds(
+      name,
+      previous.filter(({ id }) => !targetIds.has(id)).map(({ id }) => id),
+    );
   }
 
   private async documentsByRelativePath(name: string, relativePath: string): Promise<Document[]> {
@@ -225,38 +226,13 @@ export class LanceDBStore {
   }
 
   async deleteByIds(name: string, ids: string[]): Promise<void> {
-    const db = this.ensureConnected();
-    const tbl = await db.openTable(name);
-
-    // Try native row-level delete first
-    try {
-      const escaped = ids.map((id) => `'${id.replace(/'/g, "''")}'`);
-      const BATCH = 200;
-      for (let i = 0; i < escaped.length; i += BATCH) {
-        const batch = escaped.slice(i, i + BATCH).join(", ");
-        await tbl.delete(`id IN (${batch})`);
-      }
-      return;
-    } catch {
-      console.error("[store] native delete (by id) failed, falling back to drop+recreate");
-    }
-
-    // Fallback: full table rebuild
-    const all = await tbl.query().toArray();
-    const filtered = all.filter(
-      (r: Record<string, unknown>) => !ids.includes(r.id as string)
-    );
-    await db.dropTable(name);
-    if (filtered.length > 0) {
-      const newTbl = await db.createTable(name, filtered as lancedb.Data);
-      try {
-        await newTbl.createIndex("text", {
-          config: lancedb.Index.fts(),
-          replace: true,
-        });
-      } catch { }
-    } else {
-      await db.createTable(name, [], { mode: "create" });
+    if (ids.length === 0) return;
+    const table = await this.ensureConnected().openTable(name);
+    const escaped = ids.map((id) => `'${id.replace(/'/g, "''")}'`);
+    const batchSize = 200;
+    for (let index = 0; index < escaped.length; index += batchSize) {
+      const batch = escaped.slice(index, index + batchSize).join(", ");
+      await table.delete(`id IN (${batch})`);
     }
   }
 

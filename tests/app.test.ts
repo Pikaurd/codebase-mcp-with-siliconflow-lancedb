@@ -103,6 +103,14 @@ describe("CodebaseService", () => {
     });
   });
 
+  it("rejects an ambiguous status request containing both path and job id", async () => {
+    const { root, service } = await fixture();
+
+    await expect(service.getStatus({ path: root, jobId: "job-id" })).rejects.toMatchObject({
+      code: "INTERNAL_ERROR",
+    });
+  });
+
   it("returns CODEBASE_NOT_INDEXED instead of touching a missing collection", async () => {
     const { root, service } = await fixture();
 

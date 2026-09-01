@@ -111,6 +111,13 @@ export class CodebaseService {
   }
 
   async getStatus(request: StatusRequest): Promise<StatusResponse> {
+    if (request.path && request.jobId) {
+      throw new ServiceError(
+        "INTERNAL_ERROR",
+        "Status request selectors are ambiguous",
+        "Provide either a path or a job id",
+      );
+    }
     const canonicalRequestPath = request.path
       ? await this.canonicalPath(request.path)
       : undefined;

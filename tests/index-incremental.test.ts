@@ -435,10 +435,11 @@ describe("Incremental indexing flow", () => {
 
 describe("LanceDBStore file replacement", () => {
   afterEach(async () => {
+    vi.restoreAllMocks();
     await fs.rm(TMP_DIR, { recursive: true, force: true });
   });
 
-  it("restores old chunks when insertion fails after deletion", async () => {
+  it("retains old chunks when every attempted replacement insert fails", async () => {
     const store = new LanceDBStore(path.join(TMP_DIR, "lance"));
     await store.connect();
     const oldDocument = {
@@ -453,7 +454,7 @@ describe("LanceDBStore file replacement", () => {
       codebasePath: "/repo",
     };
     await store.insert("collection", [oldDocument]);
-    vi.spyOn(store, "insert").mockRejectedValueOnce(new Error("controlled insert failure"));
+    vi.spyOn(store, "insert").mockRejectedValue(new Error("controlled insert failure"));
 
     await expect(store.replaceByRelativePath("collection", "src/a.ts", [{
       ...oldDocument,
@@ -483,5 +484,34 @@ describe("LanceDBStore file replacement", () => {
 
     const results = await store.search("collection", [1, 0, 0], "first", 10);
     expect(results.map(({ text }) => text)).toEqual(["export const first = 1;"]);
+  });
+
+  it("keeps the table intact when native superseded-id deletion fails", async () => {
+    const store = new LanceDBStore(path.join(TMP_DIR, "delete-lance"));
+    await store.connect();
+    const oldDocument = {
+      id: "src/a.ts:1-1:old",
+      relativePath: "src/a.ts",
+      vector: [1, 0, 0],
+      text: "export const original = 1;",
+      startLine: 1,
+      endLine: 1,
+      fileExtension: ".ts",
+      metadata: JSON.stringify({ language: "typescript" }),
+      codebasePath: "/repo",
+    };
+    await store.insert("collection", [oldDocument]);
+    const connection = Reflect.get(store, "db");
+    const table = await connection.openTable("collection");
+    const openTable = vi.spyOn(connection, "openTable").mockResolvedValue(table);
+    vi.spyOn(table, "delete").mockRejectedValue(new Error("controlled delete failure"));
+
+    await expect(store.deleteByIds("collection", [oldDocument.id])).rejects.toThrow(
+      "controlled delete failure",
+    );
+    openTable.mockRestore();
+
+    const results = await store.search("collection", [1, 0, 0], "original", 10);
+    expect(results.map(({ text }) => text)).toContain("export const original = 1;");
   });
 });
