@@ -2,7 +2,11 @@ import { ServiceError } from "./errors.js";
 import { Indexer } from "./indexer.js";
 import { canonicalizeAllowedPath } from "./path-policy.js";
 import type { CodebaseRecord, IndexJob, MetadataRepository } from "./repository.js";
-import { IndexJobScheduler, type EnqueueResult } from "./scheduler.js";
+import {
+  IndexJobScheduler,
+  type EnqueueResult,
+  type ShutdownResult,
+} from "./scheduler.js";
 import type { VectorStoreLike } from "./store.js";
 import type {
   ClearRequest,
@@ -131,6 +135,10 @@ export class CodebaseService {
       job,
       codebase: requestedPath ? this.repository.getCodebase(requestedPath) : undefined,
     };
+  }
+
+  shutdown(timeoutMs: number): Promise<ShutdownResult> {
+    return this.scheduler.shutdown(timeoutMs);
   }
 
   async runIndexJob(job: IndexJob): Promise<{ processedFiles: number; totalChunks: number }> {

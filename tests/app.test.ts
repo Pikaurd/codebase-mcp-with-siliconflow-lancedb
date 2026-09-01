@@ -228,6 +228,26 @@ describe("CodebaseService", () => {
     expect((await second).results).toHaveLength(1);
   });
 
+  it("marks an active indexing job interrupted when bounded shutdown expires", async () => {
+    const { root, service, embedding } = await fixture();
+    await writeFixtureFile(root, "src/a.ts", "export const shutdown = true;");
+    const gate = embedding.pauseTextContaining("shutdown = true");
+    const indexed = await service.index({ path: root });
+    await gate.entered;
+
+    try {
+      await expect(service.shutdown(10)).resolves.toEqual({ drained: false });
+      expect((await service.getStatus({ jobId: indexed.jobId })).job).toMatchObject({
+        state: "interrupted",
+      });
+      await expect(service.index({ path: root })).rejects.toMatchObject({
+        code: "SERVICE_UNAVAILABLE",
+      });
+    } finally {
+      gate.release();
+    }
+  });
+
   it("queues clear work and removes searchable codebase metadata", async () => {
     const { root, service } = await fixture();
     await writeFixtureFile(root, "src/a.ts", "export const original = 1;");

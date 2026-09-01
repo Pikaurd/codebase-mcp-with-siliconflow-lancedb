@@ -38,7 +38,7 @@ function correlationId(request: Request): string {
 
 function localAuthority(httpServer: Server): string | undefined {
   const address = httpServer.address();
-  if (!address || typeof address === "string") return undefined;
+  if (!address || typeof address === "string" || address.address !== "127.0.0.1") return undefined;
   return address.port === 80 ? "127.0.0.1" : `127.0.0.1:${address.port}`;
 }
 
@@ -177,9 +177,9 @@ export function createHttpServer(app: CodebaseService, config: ServiceConfig): S
   web.get("/mcp", handleExistingSession);
   web.delete("/mcp", handleExistingSession);
 
-  web.use((error: unknown, request: Request, response: Response, _next: NextFunction) => {
+  web.use((_error: unknown, request: Request, response: Response, _next: NextFunction) => {
     const id = correlationId(request);
-    console.error(`[http] requestId=${id} invalid request`, error);
+    console.error(`[http] requestId=${id} invalid JSON`);
     if (!response.headersSent) {
       response.status(400).json({
         jsonrpc: "2.0",

@@ -23,6 +23,10 @@ export interface EnqueueResult {
   state: IndexJobState;
 }
 
+export interface ShutdownResult {
+  drained: boolean;
+}
+
 export type IndexJobExecutor = (job: IndexJob) => Promise<JobStatistics | void>;
 
 interface ScheduledJob {
@@ -34,6 +38,9 @@ export class IndexJobScheduler {
   private readonly activePaths = new Set<string>();
   private runningCount = 0;
   private pumpPending = false;
+  private stopping = false;
+  private shutdownPromise?: Promise<ShutdownResult>;
+  private readonly idleWaiters = new Set<() => void>();
 
   constructor(
     private readonly repository: MetadataRepository,
@@ -59,6 +66,13 @@ export class IndexJobScheduler {
   }
 
   enqueue(request: EnqueueRequest): EnqueueResult {
+    if (this.stopping) {
+      throw new ServiceError(
+        "SERVICE_UNAVAILABLE",
+        "The scheduler is shutting down",
+        "Retry after the service restarts",
+      );
+    }
     const options = JSON.stringify(request.options);
     const existing = this.repository.findActiveJob(request.path, request.kind, options);
     if (existing) {
@@ -79,8 +93,44 @@ export class IndexJobScheduler {
     return { jobId: job.id, reused: false, state: job.state };
   }
 
+  shutdown(timeoutMs: number): Promise<ShutdownResult> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.stopping = true;
+    this.shutdownPromise = this.finishShutdown(Math.max(0, timeoutMs));
+    return this.shutdownPromise;
+  }
+
+  private async finishShutdown(timeoutMs: number): Promise<ShutdownResult> {
+    const queuedJobs = [...this.queues.values()].flat().map(({ job }) => job);
+    this.queues.clear();
+    for (const job of queuedJobs) {
+      try {
+        this.repository.transitionJob(job.id, "interrupted");
+      } catch {
+        // A concurrent transition already made the job terminal.
+      }
+    }
+    if (this.runningCount === 0) return { drained: true };
+
+    const drained = await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (value: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        this.idleWaiters.delete(onIdle);
+        resolve(value);
+      };
+      const onIdle = (): void => finish(true);
+      const timeout = setTimeout(() => finish(false), timeoutMs);
+      this.idleWaiters.add(onIdle);
+    });
+    if (!drained) this.repository.markRunningJobsInterrupted();
+    return { drained };
+  }
+
   private requestPump(): void {
-    if (this.pumpPending) return;
+    if (this.stopping || this.pumpPending) return;
     this.pumpPending = true;
     queueMicrotask(() => {
       this.pumpPending = false;
@@ -89,6 +139,7 @@ export class IndexJobScheduler {
   }
 
   private pump(): void {
+    if (this.stopping) return;
     while (this.runningCount < this.maxConcurrency) {
       const next = this.nextRunnableJob();
       if (!next) return;
@@ -139,6 +190,9 @@ export class IndexJobScheduler {
     } finally {
       this.runningCount -= 1;
       this.activePaths.delete(scheduled.job.path);
+      if (this.runningCount === 0) {
+        for (const waiter of [...this.idleWaiters]) waiter();
+      }
       this.requestPump();
     }
   }

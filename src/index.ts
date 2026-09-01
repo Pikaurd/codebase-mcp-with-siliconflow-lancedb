@@ -43,10 +43,12 @@ async function main(): Promise<void> {
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
     if (stopping) return;
     stopping = true;
-    console.error(`[shutdown] ${signal} received; draining HTTP sessions`);
+    console.error(`[shutdown] ${signal} received; draining HTTP sessions and indexing jobs`);
     try {
-      await closeHttpServer(server);
-      console.error("[shutdown] complete");
+      const httpShutdown = closeHttpServer(server);
+      const indexing = await app.shutdown(5_000);
+      await httpShutdown;
+      console.error(`[shutdown] complete; indexing jobs ${indexing.drained ? "drained" : "interrupted"}`);
     } catch (error) {
       console.error("[shutdown] failed", error);
       process.exitCode = 1;

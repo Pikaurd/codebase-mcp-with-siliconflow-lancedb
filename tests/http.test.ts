@@ -6,7 +6,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Server } from "node:http";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { closeHttpServer, createHttpServer } from "../src/http.js";
 import { MetadataRepository } from "../src/repository.js";
 import type { ServiceConfig } from "../src/types.js";
@@ -185,6 +185,7 @@ async function waitForStderr(
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(running.splice(0).map(async ({ server, service }) => {
     await closeHttpServer(server);
     await service.cleanup();
@@ -204,6 +205,29 @@ describe("local Streamable HTTP MCP", () => {
     } finally {
       await service.cleanup();
     }
+  });
+
+  it("rejects requests when the underlying socket was bound to a wildcard address", async () => {
+    const service = await createServiceFixture();
+    const config = configFor(service);
+    const server = createHttpServer(service.service, config);
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "0.0.0.0", () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+    const port = (server.address() as AddressInfo).port;
+    running.push({ baseUrl: `http://127.0.0.1:${port}`, config, service, server });
+
+    const response = await fetch(`http://127.0.0.1:${port}/healthz`);
+
+    expect(response.status).toBe(403);
+    expect(await responseBody(response)).toMatchObject({
+      code: "UNAUTHORIZED",
+      requestId: expect.any(String),
+    });
   });
 
   it.each([undefined, "Bearer bad", "Basic test-token"])(
@@ -288,6 +312,30 @@ describe("local Streamable HTTP MCP", () => {
     expect(serialized).not.toContain(service.root);
   });
 
+  it("does not log malformed JSON bodies or parser error details", async () => {
+    const { baseUrl } = await start();
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const secretBody = `{"payload":"${SECRET}"`;
+
+    const response = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: mcpHeaders(),
+      body: secretBody,
+    });
+    const body = await responseBody(response);
+    const logs = errorLog.mock.calls.flat().map(String).join("\n");
+
+    expect(response.status).toBe(400);
+    expect(body).toMatchObject({
+      jsonrpc: "2.0",
+      error: { code: -32700, data: { requestId: expect.any(String) } },
+    });
+    expect(logs).toMatch(/requestId=.*invalid JSON/);
+    expect(logs).not.toContain(SECRET);
+    expect(logs).not.toContain(secretBody);
+    expect(errorLog.mock.calls.every((call) => call.length === 1)).toBe(true);
+  });
+
   it("discovers the four shared codebase tools with a valid token", async () => {
     const { baseUrl } = await start();
     const client = await connect(baseUrl);
@@ -302,6 +350,46 @@ describe("local Streamable HTTP MCP", () => {
       "clear_index",
       "get_indexing_status",
     ]);
+  });
+
+  it.each([
+    ["force type", "index_codebase", { path: "ROOT", force: "false" }],
+    ["splitter enum", "index_codebase", { path: "ROOT", splitter: "regex" }],
+    ["custom extension items", "index_codebase", { path: "ROOT", customExtensions: [7] }],
+    ["ignore patterns", "index_codebase", { path: "ROOT", ignorePatterns: "dist" }],
+    ["index extras", "index_codebase", { path: "ROOT", unexpected: true }],
+    ["search path", "search_code", { path: 7, query: "query" }],
+    ["search query", "search_code", { path: "ROOT", query: "" }],
+    ["search limit minimum", "search_code", { path: "ROOT", query: "query", limit: 0 }],
+    ["search limit integer", "search_code", { path: "ROOT", query: "query", limit: 1.5 }],
+    ["search filters", "search_code", { path: "ROOT", query: "query", extensionFilter: [7] }],
+    ["clear path", "clear_index", { path: null }],
+    ["status selector required", "get_indexing_status", {}],
+    ["status selector exclusivity", "get_indexing_status", { path: "ROOT", jobId: "job" }],
+    ["status job id", "get_indexing_status", { jobId: 7 }],
+  ] as const)("rejects malformed %s arguments before application dispatch", async (
+    _case,
+    name,
+    rawArguments,
+  ) => {
+    const { baseUrl, service } = await start();
+    const client = await connect(baseUrl);
+    const arguments_ = Object.fromEntries(
+      Object.entries(rawArguments).map(([key, value]) => [key, value === "ROOT" ? service.root : value]),
+    );
+
+    const response = await client.post("tools/call", { name, arguments: arguments_ });
+    const body = await responseBody(response);
+
+    expect(response.status).toBe(200);
+    expect(body.result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        code: "INTERNAL_ERROR",
+        suggestedAction: expect.any(String),
+        requestId: expect.any(String),
+      },
+    });
   });
 
   it("returns detailed sanitized PATH_NOT_ALLOWED tool output", async () => {

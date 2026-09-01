@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { isAbsolute } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
@@ -75,20 +76,61 @@ export function withMcpRequestId<T>(requestId: string, callback: () => Promise<T
   return requestIds.run(requestId, callback);
 }
 
+function invalidArguments(): ServiceError {
+  return new ServiceError(
+    "INTERNAL_ERROR",
+    "Tool arguments are invalid",
+    "Use the tool input schema returned by tools/list",
+  );
+}
+
+function assertAllowedKeys(args: Record<string, unknown>, allowed: readonly string[]): void {
+  const allowedKeys = new Set(allowed);
+  if (Object.keys(args).some((key) => !allowedKeys.has(key))) throw invalidArguments();
+}
+
 function requiredString(args: Record<string, unknown>, name: string): string {
   const value = args[name];
-  if (typeof value !== "string" || value.length === 0) {
-    throw new ServiceError("INTERNAL_ERROR", `${name} must be a non-empty string`, `Provide ${name}`);
-  }
+  if (typeof value !== "string" || value.trim().length === 0) throw invalidArguments();
   return value;
+}
+
+function requiredPath(args: Record<string, unknown>): string {
+  const value = requiredString(args, "path");
+  if (!isAbsolute(value)) throw invalidArguments();
+  return value;
+}
+
+function optionalBoolean(args: Record<string, unknown>, name: string): boolean | undefined {
+  const value = args[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw invalidArguments();
+  return value;
+}
+
+function optionalSplitter(args: Record<string, unknown>): "ast" | "langchain" | undefined {
+  const value = args.splitter;
+  if (value === undefined) return undefined;
+  if (value !== "ast" && value !== "langchain") throw invalidArguments();
+  return value;
+}
+
+function optionalLimit(args: Record<string, unknown>): number | undefined {
+  const value = args.limit;
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 50) {
+    throw invalidArguments();
+  }
+  return value as number;
 }
 
 function optionalStringArray(args: Record<string, unknown>, name: string): string[] | undefined {
   const value = args[name];
   if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
-    throw new ServiceError("INTERNAL_ERROR", `${name} must be a string array`, `Provide valid ${name}`);
-  }
+  if (
+    !Array.isArray(value)
+    || value.some((item) => typeof item !== "string" || item.trim().length === 0)
+  ) throw invalidArguments();
   return value;
 }
 
@@ -131,10 +173,17 @@ export function createMcpServer(app: CodebaseService): Server {
     try {
       switch (request.params.name) {
         case "index_codebase": {
+          assertAllowedKeys(args, [
+            "path",
+            "force",
+            "splitter",
+            "customExtensions",
+            "ignorePatterns",
+          ]);
           const queued = await app.index({
-            path: requiredString(args, "path"),
-            force: args.force === undefined ? undefined : Boolean(args.force),
-            splitter: args.splitter as "ast" | "langchain" | undefined,
+            path: requiredPath(args),
+            force: optionalBoolean(args, "force"),
+            splitter: optionalSplitter(args),
             customExtensions: optionalStringArray(args, "customExtensions"),
             ignorePatterns: optionalStringArray(args, "ignorePatterns"),
           });
@@ -151,10 +200,11 @@ export function createMcpServer(app: CodebaseService): Server {
           });
         }
         case "search_code": {
+          assertAllowedKeys(args, ["path", "query", "limit", "extensionFilter"]);
           const search = await app.search({
-            path: requiredString(args, "path"),
+            path: requiredPath(args),
             query: requiredString(args, "query"),
-            limit: typeof args.limit === "number" ? args.limit : undefined,
+            limit: optionalLimit(args),
             extensionFilter: optionalStringArray(args, "extensionFilter"),
           });
           return result({
@@ -166,7 +216,8 @@ export function createMcpServer(app: CodebaseService): Server {
           });
         }
         case "clear_index": {
-          const queued = await app.clear({ path: requiredString(args, "path") });
+          assertAllowedKeys(args, ["path"]);
+          const queued = await app.clear({ path: requiredPath(args) });
           return result({
             code: queued.reused ? "JOB_REUSED" : "JOB_QUEUED",
             message: queued.reused
@@ -180,8 +231,12 @@ export function createMcpServer(app: CodebaseService): Server {
           });
         }
         case "get_indexing_status": {
+          assertAllowedKeys(args, ["path", "jobId"]);
+          const hasPath = args.path !== undefined;
+          const hasJobId = args.jobId !== undefined;
+          if (hasPath === hasJobId) throw invalidArguments();
           const status = await app.getStatus({
-            path: args.path === undefined ? undefined : requiredString(args, "path"),
+            path: args.path === undefined ? undefined : requiredPath(args),
             jobId: args.jobId === undefined ? undefined : requiredString(args, "jobId"),
           });
           return result({
