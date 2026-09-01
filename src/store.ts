@@ -2,6 +2,21 @@ import * as lancedb from "@lancedb/lancedb";
 import type { Connection, Table } from "@lancedb/lancedb";
 import type { Document, SearchResult } from "./types.js";
 
+export interface VectorStoreLike {
+  insert(name: string, documents: Document[]): Promise<void>;
+  replaceByRelativePath(name: string, relativePath: string, documents: Document[]): Promise<void>;
+  deleteByRelativePaths(name: string, relativePaths: string[]): Promise<void>;
+  dropTable(name: string): Promise<void>;
+  hasTable(name: string): Promise<boolean>;
+  getRowCount(name: string): Promise<number>;
+  search(
+    name: string,
+    queryVector: number[],
+    queryText: string,
+    limit?: number,
+  ): Promise<SearchResult[]>;
+}
+
 const TABLE_SCHEMA = {
   id: "string",
   vector: new Array(1024),
@@ -45,8 +60,12 @@ export class LanceDBStore {
     const db = this.ensureConnected();
     try {
       const tbl = await db.openTable(name);
-      await tbl.compactFiles();
-      await tbl.cleanupOldVersions(undefined, true);
+      const compactable = tbl as Table & {
+        compactFiles?: () => Promise<unknown>;
+        cleanupOldVersions?: (olderThan?: Date, deleteUnverified?: boolean) => Promise<unknown>;
+      };
+      await compactable.compactFiles?.();
+      await compactable.cleanupOldVersions?.(undefined, true);
     } catch {
       // silently skip if compact fails (Node.js LanceDB may not support these)
     }
@@ -94,6 +113,45 @@ export class LanceDBStore {
         // FTS not available; vector search still works
       }
     }
+  }
+
+  async replaceByRelativePath(
+    name: string,
+    relativePath: string,
+    documents: Document[],
+  ): Promise<void> {
+    if (!(await this.hasTable(name))) {
+      await this.insert(name, documents);
+      return;
+    }
+    const previous = await this.documentsByRelativePath(name, relativePath);
+    await this.deleteByRelativePaths(name, [relativePath]);
+    try {
+      await this.insert(name, documents);
+    } catch (error) {
+      await this.deleteByRelativePaths(name, [relativePath]);
+      await this.insert(name, previous);
+      throw error;
+    }
+  }
+
+  private async documentsByRelativePath(name: string, relativePath: string): Promise<Document[]> {
+    if (!(await this.hasTable(name))) return [];
+    const table = await this.ensureConnected().openTable(name);
+    const rows = await table.query().toArray();
+    return rows
+      .filter((row: Record<string, unknown>) => row.relativePath === relativePath)
+      .map((row: Record<string, unknown>) => ({
+        id: row.id as string,
+        vector: Array.from(row.vector as ArrayLike<number>),
+        text: row.text as string,
+        relativePath: row.relativePath as string,
+        startLine: row.startLine as number,
+        endLine: row.endLine as number,
+        fileExtension: row.fileExtension as string,
+        metadata: row.metadata as string,
+        codebasePath: row.codebasePath as string,
+      }));
   }
 
   async search(

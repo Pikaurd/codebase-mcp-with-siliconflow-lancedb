@@ -46,6 +46,19 @@ export class FakeStore {
     this.tables.get(name)!.push(...rows);
   }
 
+  async replaceByRelativePath(
+    name: string,
+    relativePath: string,
+    documents: Document[],
+  ): Promise<void> {
+    const rows = this.tables.get(name) ?? [];
+    const replacement = documents.map((doc) => ({ ...doc }));
+    this.tables.set(
+      name,
+      rows.filter((row) => row.relativePath !== relativePath).concat(replacement),
+    );
+  }
+
   async deleteByRelativePaths(name: string, relativePaths: string[]): Promise<void> {
     if (relativePaths.length === 0) return;
     const rows = this.tables.get(name);
@@ -60,6 +73,24 @@ export class FakeStore {
 
   async getRowCount(name: string): Promise<number> {
     return this.tables.get(name)?.length ?? 0;
+  }
+
+  async search(
+    name: string,
+    _queryVector: number[],
+    _queryText: string,
+    limit = 10,
+  ): Promise<SearchResult[]> {
+    return (this.tables.get(name) ?? []).slice(0, limit).map((row) => ({
+      id: row.id,
+      text: row.text,
+      relativePath: row.relativePath,
+      startLine: row.startLine,
+      endLine: row.endLine,
+      fileExtension: row.fileExtension,
+      metadata: JSON.parse(row.metadata) as Record<string, unknown>,
+      score: 1,
+    }));
   }
 
   getRows(name: string): FakeRow[] {

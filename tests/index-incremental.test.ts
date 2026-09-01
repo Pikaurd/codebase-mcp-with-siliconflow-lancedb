@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { FakeStore } from "./fake-store.js";
 import { FileSynchronizer } from "../src/sync.js";
 import { splitCode, generateId } from "../src/splitter.js";
 import { createHash } from "crypto";
+import { LanceDBStore } from "../src/store.js";
 
 const TMP_DIR = path.join(import.meta.dirname, "..", ".tmp_test_index");
 
@@ -429,5 +430,58 @@ describe("Incremental indexing flow", () => {
     // b.ts hash should NOT have been updated (still old value)
     const hashes = syncer.getHashes();
     expect(hashes["b.ts"]).toBe(syncer.hashContent("export const y = 2;"));
+  });
+});
+
+describe("LanceDBStore file replacement", () => {
+  afterEach(async () => {
+    await fs.rm(TMP_DIR, { recursive: true, force: true });
+  });
+
+  it("restores old chunks when insertion fails after deletion", async () => {
+    const store = new LanceDBStore(path.join(TMP_DIR, "lance"));
+    await store.connect();
+    const oldDocument = {
+      id: "src/a.ts:1-1:old",
+      relativePath: "src/a.ts",
+      vector: [1, 0, 0],
+      text: "export const original = 1;",
+      startLine: 1,
+      endLine: 1,
+      fileExtension: ".ts",
+      metadata: JSON.stringify({ language: "typescript" }),
+      codebasePath: "/repo",
+    };
+    await store.insert("collection", [oldDocument]);
+    vi.spyOn(store, "insert").mockRejectedValueOnce(new Error("controlled insert failure"));
+
+    await expect(store.replaceByRelativePath("collection", "src/a.ts", [{
+      ...oldDocument,
+      id: "src/a.ts:1-1:new",
+      text: "export const replacement = 999;",
+    }])).rejects.toThrow("controlled insert failure");
+
+    const results = await store.search("collection", [1, 0, 0], "original", 10);
+    expect(results.map(({ text }) => text)).toContain("export const original = 1;");
+    expect(results.map(({ text }) => text).join("\n")).not.toContain("replacement = 999");
+  });
+
+  it("creates a missing collection when replacing a new file", async () => {
+    const store = new LanceDBStore(path.join(TMP_DIR, "new-lance"));
+    await store.connect();
+    await store.replaceByRelativePath("collection", "src/a.ts", [{
+      id: "src/a.ts:1-1:new",
+      relativePath: "src/a.ts",
+      vector: [1, 0, 0],
+      text: "export const first = 1;",
+      startLine: 1,
+      endLine: 1,
+      fileExtension: ".ts",
+      metadata: JSON.stringify({ language: "typescript" }),
+      codebasePath: "/repo",
+    }]);
+
+    const results = await store.search("collection", [1, 0, 0], "first", 10);
+    expect(results.map(({ text }) => text)).toEqual(["export const first = 1;"]);
   });
 });

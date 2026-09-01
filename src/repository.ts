@@ -54,6 +54,17 @@ export interface UpsertCodebaseInput {
   latestCompletedJobId?: string;
 }
 
+export interface CodebaseRecord {
+  path: string;
+  collectionName: string;
+  status: string;
+  indexedFiles: number;
+  totalChunks: number;
+  latestCompletedJobId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface JobRow {
   id: string;
   path: string;
@@ -67,6 +78,17 @@ interface JobRow {
   total_chunks: number;
   failure_code: ServiceErrorCode | null;
   failure_message: string | null;
+}
+
+interface CodebaseRow {
+  path: string;
+  collection_name: string;
+  index_status: string;
+  indexed_files: number;
+  total_chunks: number;
+  latest_completed_job_id: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 function now(): string {
@@ -209,6 +231,15 @@ export class MetadataRepository {
     return row && toIndexJob(row);
   }
 
+  getLatestJob(path: string): IndexJob | undefined {
+    const row = this.db.prepare(
+      `SELECT id, path, kind, state, options, created_at, started_at, completed_at,
+              processed_files, total_chunks, failure_code, failure_message
+       FROM index_jobs WHERE path = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+    ).get(path) as JobRow | undefined;
+    return row && toIndexJob(row);
+  }
+
   updateJobStatistics(id: string, statistics: JobStatistics): IndexJob {
     const update = this.db.transaction(() => {
       if (!this.getJob(id)) {
@@ -242,6 +273,25 @@ export class MetadataRepository {
          latest_completed_job_id = excluded.latest_completed_job_id,
          updated_at = excluded.updated_at`,
     ).run({ ...input, latestCompletedJobId: input.latestCompletedJobId ?? null, updatedAt });
+  }
+
+  getCodebase(path: string): CodebaseRecord | undefined {
+    const row = this.db.prepare(
+      `SELECT path, collection_name, index_status, indexed_files, total_chunks,
+              latest_completed_job_id, created_at, updated_at
+       FROM codebases WHERE path = ?`,
+    ).get(path) as CodebaseRow | undefined;
+    if (!row) return undefined;
+    return {
+      path: row.path,
+      collectionName: row.collection_name,
+      status: row.index_status,
+      indexedFiles: row.indexed_files,
+      totalChunks: row.total_chunks,
+      latestCompletedJobId: row.latest_completed_job_id ?? undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
   }
 
   replaceFileHashes(path: string, hashes: Record<string, string>): void {

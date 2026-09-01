@@ -35,6 +35,7 @@ export interface SearchResult {
 export interface Snapshot {
   formatVersion: string;
   codebases: Record<string, CodebaseSnapshot>;
+  lastUpdated?: string;
 }
 
 export interface CodebaseSnapshot {
@@ -56,6 +57,38 @@ export interface IndexingResult {
 export interface EmbeddingResult {
   vector: number[];
   dimension: number;
+}
+
+export interface EmbeddingLike {
+  embed(texts: string[]): Promise<EmbeddingResult[]>;
+  embedSingle(text: string): Promise<EmbeddingResult>;
+}
+
+export interface IndexOptions {
+  force?: boolean;
+  splitter?: "ast" | "langchain";
+  customExtensions?: string[];
+  ignorePatterns?: string[];
+}
+
+export interface IndexRequest extends IndexOptions {
+  path: string;
+}
+
+export interface SearchRequest {
+  path: string;
+  query: string;
+  limit?: number;
+  extensionFilter?: string[];
+}
+
+export interface ClearRequest {
+  path: string;
+}
+
+export interface StatusRequest {
+  path?: string;
+  jobId?: string;
 }
 
 export interface ServiceConfig {
