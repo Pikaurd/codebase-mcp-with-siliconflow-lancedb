@@ -48,8 +48,8 @@ npm run start
 
 It binds only to `http://127.0.0.1:3000` by default and logs lifecycle events
 to stderr. Use `Ctrl-C` (SIGINT) or send SIGTERM for a graceful shutdown; the
-service stops accepting HTTP work, closes MCP sessions, and drains indexing
-jobs for up to five seconds. Do not run a separate stdio server per client.
+service stops accepting HTTP work, closes MCP sessions, and drains all accepted
+indexing and clear jobs before exiting. Do not run a separate stdio server per client.
 
 Check the limited unauthenticated health endpoint:
 

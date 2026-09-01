@@ -13,6 +13,7 @@ import type { ServiceConfig } from "../src/types.js";
 import {
   createServiceFixture,
   type ServiceFixture,
+  waitForJob,
   writeFixtureFile,
 } from "./helpers/service.js";
 
@@ -487,6 +488,29 @@ describe("local Streamable HTTP MCP", () => {
     } finally {
       gate.release();
     }
+  });
+
+  it("keeps an accepted indexing job running after its MCP client disconnects", async () => {
+    const { baseUrl, service } = await start();
+    await writeFixtureFile(service.root, "src/a.ts", "export const detached = 1;");
+    const gate = service.embedding.pauseTextContaining("detached = 1");
+    const client = await connect(baseUrl);
+    const response = await client.post("tools/call", {
+      name: "index_codebase",
+      arguments: { path: service.root },
+    });
+    const jobId = (await responseBody(response)).result.structuredContent.jobId as string;
+    await gate.entered;
+
+    await fetch(`${baseUrl}/mcp`, {
+      method: "DELETE",
+      headers: { ...mcpHeaders(), "mcp-session-id": client.id },
+    });
+    expect((await service.service.getStatus({ jobId })).job?.state).toBe("running");
+
+    gate.release();
+    await waitForJob(service.service, jobId);
+    expect((await service.service.getStatus({ jobId })).job?.state).toBe("completed");
   });
 
   it("recovers active jobs and drains on SIGTERM with stderr-only lifecycle logs", async () => {

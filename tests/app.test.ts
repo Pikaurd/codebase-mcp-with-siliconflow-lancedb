@@ -228,7 +228,7 @@ describe("CodebaseService", () => {
     expect((await second).results).toHaveLength(1);
   });
 
-  it("marks an active indexing job interrupted when bounded shutdown expires", async () => {
+  it("drains an active indexing job naturally during shutdown", async () => {
     const { root, service, embedding } = await fixture();
     await writeFixtureFile(root, "src/a.ts", "export const shutdown = true;");
     const gate = embedding.pauseTextContaining("shutdown = true");
@@ -236,42 +236,22 @@ describe("CodebaseService", () => {
     await gate.entered;
 
     try {
-      await expect(service.shutdown(10)).resolves.toEqual({ drained: false });
-      expect((await service.getStatus({ jobId: indexed.jobId })).job).toMatchObject({
-        state: "interrupted",
-      });
+      const shutdown = service.shutdown();
+      await expect(Promise.race([
+        shutdown.then(() => "completed"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("waiting"), 20)),
+      ])).resolves.toBe("waiting");
       await expect(service.index({ path: root })).rejects.toMatchObject({
         code: "SERVICE_UNAVAILABLE",
+      });
+      gate.release();
+      await expect(shutdown).resolves.toEqual({ drained: true });
+      expect((await service.getStatus({ jobId: indexed.jobId })).job).toMatchObject({
+        state: "completed",
       });
     } finally {
       gate.release();
     }
-  });
-
-  it("does not publish an interrupted update job as the completed codebase version", async () => {
-    const { root, service, embedding, repository, store } = await fixture();
-    await writeFixtureFile(root, "src/a.ts", "export const original = 1;");
-    const initial = await service.index({ path: root });
-    await waitForJob(service, initial.jobId);
-
-    await writeFixtureFile(root, "src/a.ts", "export const interrupted = 2;");
-    const gate = embedding.pauseTextContaining("interrupted = 2");
-    const update = await service.index({ path: root });
-    await gate.entered;
-    const transition = vi.spyOn(repository, "transitionJob");
-    await expect(service.shutdown(10)).resolves.toEqual({ drained: false });
-    gate.release();
-
-    await vi.waitFor(() => expect(transition).toHaveBeenCalledWith(
-      update.jobId,
-      "failed",
-      expect.any(Object),
-    ));
-
-    expect(repository.getJob(update.jobId)?.state).toBe("interrupted");
-    expect(repository.getCodebase(root)?.latestCompletedJobId).toBe(initial.jobId);
-    expect(store.getRows(repository.getCodebase(root)!.collectionName).map(({ text }) => text))
-      .toContain("export const original = 1;");
   });
 
   it("queues clear work and removes searchable codebase metadata", async () => {

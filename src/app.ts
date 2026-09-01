@@ -137,8 +137,8 @@ export class CodebaseService {
     };
   }
 
-  shutdown(timeoutMs: number): Promise<ShutdownResult> {
-    return this.scheduler.shutdown(timeoutMs);
+  shutdown(): Promise<ShutdownResult> {
+    return this.scheduler.shutdown();
   }
 
   async runIndexJob(job: IndexJob): Promise<{ processedFiles: number; totalChunks: number }> {

@@ -46,9 +46,9 @@ async function main(): Promise<void> {
     console.error(`[shutdown] ${signal} received; draining HTTP sessions and indexing jobs`);
     try {
       const httpShutdown = closeHttpServer(server);
-      const indexing = await app.shutdown(5_000);
+      const indexing = await app.shutdown();
       await httpShutdown;
-      console.error(`[shutdown] complete; indexing jobs ${indexing.drained ? "drained" : "interrupted"}`);
+      console.error(`[shutdown] complete; indexing jobs drained=${indexing.drained}`);
     } catch (error) {
       console.error("[shutdown] failed", error);
       process.exitCode = 1;

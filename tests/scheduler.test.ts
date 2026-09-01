@@ -156,6 +156,36 @@ describe("IndexJobScheduler", () => {
     await vi.waitFor(() => expect(repository.getJob(third.jobId)?.state).toBe("completed"));
   });
 
+  it("drains running and queued jobs before shutdown completes", async () => {
+    const repository = createRepository();
+    const executions: Array<{ job: IndexJob; complete: () => void }> = [];
+    const scheduler = new IndexJobScheduler(repository, async (job) => {
+      const gate = deferred();
+      executions.push({ job, complete: gate.resolve });
+      await gate.promise;
+    }, 1);
+
+    const first = scheduler.enqueue({ path: "/canonical/one", kind: "index", options: {} });
+    const second = scheduler.enqueue({ path: "/canonical/two", kind: "clear", options: {} });
+    await vi.waitFor(() => expect(executions).toHaveLength(1));
+
+    const shutdown = scheduler.shutdown();
+    await expect(Promise.race([
+      shutdown.then(() => "completed"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("waiting"), 20)),
+    ])).resolves.toBe("waiting");
+    expect(() => scheduler.enqueue({ path: "/canonical/three", kind: "index", options: {} }))
+      .toThrow(/shutting down/);
+
+    executions[0].complete();
+    await vi.waitFor(() => expect(executions).toHaveLength(2));
+    executions[1].complete();
+
+    await expect(shutdown).resolves.toEqual({ drained: true });
+    expect(repository.getJob(first.jobId)?.state).toBe("completed");
+    expect(repository.getJob(second.jobId)?.state).toBe("completed");
+  });
+
   it("uses the configured concurrency limit when composed from ServiceConfig", async () => {
     const repository = createRepository();
     const executions: Array<{ job: IndexJob; complete: () => void }> = [];

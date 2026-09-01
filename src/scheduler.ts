@@ -93,44 +93,23 @@ export class IndexJobScheduler {
     return { jobId: job.id, reused: false, state: job.state };
   }
 
-  shutdown(timeoutMs: number): Promise<ShutdownResult> {
+  shutdown(): Promise<ShutdownResult> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.stopping = true;
-    this.shutdownPromise = this.finishShutdown(Math.max(0, timeoutMs));
+    // TODO: Pass an AbortSignal into index/clear work if graceful draining becomes unacceptable.
+    this.shutdownPromise = this.finishShutdown();
     return this.shutdownPromise;
   }
 
-  private async finishShutdown(timeoutMs: number): Promise<ShutdownResult> {
-    const queuedJobs = [...this.queues.values()].flat().map(({ job }) => job);
-    this.queues.clear();
-    for (const job of queuedJobs) {
-      try {
-        this.repository.transitionJob(job.id, "interrupted");
-      } catch {
-        // A concurrent transition already made the job terminal.
-      }
-    }
-    if (this.runningCount === 0) return { drained: true };
-
-    const drained = await new Promise<boolean>((resolve) => {
-      let settled = false;
-      const finish = (value: boolean): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        this.idleWaiters.delete(onIdle);
-        resolve(value);
-      };
-      const onIdle = (): void => finish(true);
-      const timeout = setTimeout(() => finish(false), timeoutMs);
-      this.idleWaiters.add(onIdle);
-    });
-    if (!drained) this.repository.markRunningJobsInterrupted();
-    return { drained };
+  private async finishShutdown(): Promise<ShutdownResult> {
+    this.requestPump();
+    if (this.isIdle()) return { drained: true };
+    await new Promise<void>((resolve) => this.idleWaiters.add(resolve));
+    return { drained: true };
   }
 
   private requestPump(): void {
-    if (this.stopping || this.pumpPending) return;
+    if (this.pumpPending) return;
     this.pumpPending = true;
     queueMicrotask(() => {
       this.pumpPending = false;
@@ -139,10 +118,12 @@ export class IndexJobScheduler {
   }
 
   private pump(): void {
-    if (this.stopping) return;
     while (this.runningCount < this.maxConcurrency) {
       const next = this.nextRunnableJob();
-      if (!next) return;
+      if (!next) {
+        this.notifyIfIdle();
+        return;
+      }
 
       this.runningCount += 1;
       this.activePaths.add(next.job.path);
@@ -190,10 +171,19 @@ export class IndexJobScheduler {
     } finally {
       this.runningCount -= 1;
       this.activePaths.delete(scheduled.job.path);
-      if (this.runningCount === 0) {
-        for (const waiter of [...this.idleWaiters]) waiter();
-      }
       this.requestPump();
+    }
+  }
+
+  private isIdle(): boolean {
+    return this.runningCount === 0 && this.queues.size === 0;
+  }
+
+  private notifyIfIdle(): void {
+    if (!this.isIdle()) return;
+    for (const waiter of [...this.idleWaiters]) {
+      this.idleWaiters.delete(waiter);
+      waiter();
     }
   }
 }
