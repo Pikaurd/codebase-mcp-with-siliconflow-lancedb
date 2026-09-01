@@ -1,7 +1,8 @@
 import Database from "better-sqlite3";
-import { ServiceError } from "./errors.js";
+import { ServiceError, toMcpError } from "./errors.js";
+import type { ServiceErrorCode } from "./types.js";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export type IndexJobKind = "index" | "force" | "clear";
 export type IndexJobState =
@@ -28,6 +29,20 @@ export interface IndexJob {
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
+  processedFiles: number;
+  totalChunks: number;
+  failureCode?: ServiceErrorCode;
+  failureMessage?: string;
+}
+
+export interface JobStatistics {
+  processedFiles: number;
+  totalChunks: number;
+}
+
+export interface TransitionJobUpdate {
+  statistics?: JobStatistics;
+  failure?: ServiceError;
 }
 
 export interface UpsertCodebaseInput {
@@ -48,6 +63,10 @@ interface JobRow {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  processed_files: number;
+  total_chunks: number;
+  failure_code: ServiceErrorCode | null;
+  failure_message: string | null;
 }
 
 function now(): string {
@@ -88,6 +107,10 @@ function toIndexJob(row: JobRow): IndexJob {
     createdAt: row.created_at,
     startedAt: row.started_at ?? undefined,
     completedAt: row.completed_at ?? undefined,
+    processedFiles: row.processed_files,
+    totalChunks: row.total_chunks,
+    failureCode: row.failure_code ?? undefined,
+    failureMessage: row.failure_message ?? undefined,
   };
 }
 
@@ -126,7 +149,8 @@ export class MetadataRepository {
 
   findActiveJob(path: string, kind: IndexJobKind, options: string): IndexJob | undefined {
     const row = this.db.prepare(
-      `SELECT id, path, kind, state, options, created_at, started_at, completed_at
+      `SELECT id, path, kind, state, options, created_at, started_at, completed_at,
+              processed_files, total_chunks, failure_code, failure_message
        FROM index_jobs
        WHERE path = ? AND kind = ? AND options_key = ? AND state IN ('queued', 'running')
        ORDER BY created_at ASC
@@ -135,10 +159,10 @@ export class MetadataRepository {
     return row && toIndexJob(row);
   }
 
-  transitionJob(id: string, state: IndexJobState): IndexJob {
+  transitionJob(id: string, state: IndexJobState, update: TransitionJobUpdate = {}): IndexJob {
     const transition = this.db.transaction(() => {
       const current = this.getJob(id);
-      if (!current || !canTransition(current.state, state)) {
+      if (!current || !canTransition(current.state, state) || (update.failure && state !== "failed")) {
         throw new ServiceError(
           "INTERNAL_ERROR",
           "Invalid index job transition",
@@ -147,13 +171,30 @@ export class MetadataRepository {
       }
 
       const updatedAt = now();
+      const failure = update.failure && toMcpError(update.failure, "job-failure");
       this.db.prepare(
         `UPDATE index_jobs
          SET state = ?, updated_at = ?,
              started_at = CASE WHEN ? = 'running' THEN ? ELSE started_at END,
-             completed_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled', 'interrupted') THEN ? ELSE completed_at END
+             completed_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled', 'interrupted') THEN ? ELSE completed_at END,
+             processed_files = COALESCE(?, processed_files),
+             total_chunks = COALESCE(?, total_chunks),
+             failure_code = ?,
+             failure_message = ?
          WHERE id = ?`,
-      ).run(state, updatedAt, state, updatedAt, state, updatedAt, id);
+      ).run(
+        state,
+        updatedAt,
+        state,
+        updatedAt,
+        state,
+        updatedAt,
+        update.statistics?.processedFiles ?? null,
+        update.statistics?.totalChunks ?? null,
+        failure?.code ?? null,
+        failure?.message ?? null,
+        id,
+      );
       return this.getJob(id)!;
     });
     return transition();
@@ -161,10 +202,30 @@ export class MetadataRepository {
 
   getJob(id: string): IndexJob | undefined {
     const row = this.db.prepare(
-      `SELECT id, path, kind, state, options, created_at, started_at, completed_at
+      `SELECT id, path, kind, state, options, created_at, started_at, completed_at,
+              processed_files, total_chunks, failure_code, failure_message
        FROM index_jobs WHERE id = ?`,
     ).get(id) as JobRow | undefined;
     return row && toIndexJob(row);
+  }
+
+  updateJobStatistics(id: string, statistics: JobStatistics): IndexJob {
+    const update = this.db.transaction(() => {
+      if (!this.getJob(id)) {
+        throw new ServiceError(
+          "INTERNAL_ERROR",
+          "Index job was not found",
+          "Check the job id before recording its progress",
+        );
+      }
+      this.db.prepare(
+        `UPDATE index_jobs
+         SET processed_files = ?, total_chunks = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(statistics.processedFiles, statistics.totalChunks, now(), id);
+      return this.getJob(id)!;
+    });
+    return update();
   }
 
   upsertCodebase(input: UpsertCodebaseInput): void {
@@ -230,10 +291,9 @@ export class MetadataRepository {
         "Upgrade this service before opening the metadata database",
       );
     }
-    if (currentVersion === SCHEMA_VERSION) return;
-
     this.db.transaction(() => {
-      this.db.exec(`
+      if (currentVersion < 1) {
+        this.db.exec(`
         CREATE TABLE IF NOT EXISTS codebases (
           path TEXT PRIMARY KEY,
           collection_name TEXT NOT NULL,
@@ -266,8 +326,18 @@ export class MetadataRepository {
         );
         CREATE INDEX IF NOT EXISTS index_jobs_active_lookup
           ON index_jobs(path, kind, options_key, state, created_at);
-      `);
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+        `);
+        this.db.pragma("user_version = 1");
+      }
+      if (currentVersion < 2) {
+        this.db.exec(`
+          ALTER TABLE index_jobs ADD COLUMN processed_files INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE index_jobs ADD COLUMN total_chunks INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE index_jobs ADD COLUMN failure_code TEXT;
+          ALTER TABLE index_jobs ADD COLUMN failure_message TEXT;
+        `);
+        this.db.pragma("user_version = 2");
+      }
     })();
   }
 }
