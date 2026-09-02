@@ -79,6 +79,56 @@ afterEach(async () => {
 });
 
 describe("CodebaseService", () => {
+  it("records file-level progress for indexing and clear jobs", async () => {
+    const { root, service, repository, embedding } = await fixture();
+    await writeFixtureFile(root, "src/a.ts", "export const progress = true;");
+    const gate = embedding.pauseTextContaining("progress = true");
+    const indexed = await service.index({ path: root });
+    await gate.entered;
+
+    expect(repository.getJob(indexed.jobId)).toMatchObject({
+      state: "running",
+      totalFiles: 1,
+      processedFiles: 0,
+      currentFile: "src/a.ts",
+    });
+
+    gate.release();
+    await waitForJob(service, indexed.jobId);
+    expect(repository.getJob(indexed.jobId)).toMatchObject({
+      state: "completed",
+      totalFiles: 1,
+      processedFiles: 1,
+      currentFile: "src/a.ts",
+    });
+
+    const cleared = await service.clear({ path: root });
+    await waitForJob(service, cleared.jobId);
+    expect(repository.getJob(cleared.jobId)).toMatchObject({
+      state: "completed",
+      totalFiles: 0,
+      processedFiles: 0,
+      totalChunks: 0,
+    });
+    expect(repository.getJob(cleared.jobId)?.currentFile).toBeUndefined();
+  });
+
+  it("counts a file after its indexing work fails", async () => {
+    const { root, service, repository, embedding } = await fixture();
+    await writeFixtureFile(root, "src/a.ts", "export const failedProgress = true;");
+    embedding.rejectTextContaining("failedProgress = true");
+
+    const indexed = await service.index({ path: root });
+    await waitForJob(service, indexed.jobId);
+
+    expect(repository.getJob(indexed.jobId)).toMatchObject({
+      state: "failed",
+      totalFiles: 1,
+      processedFiles: 1,
+      currentFile: "src/a.ts",
+    });
+  });
+
   it("returns a durable background job id from an index request", async () => {
     const { root, service } = await fixture();
     await writeFixtureFile(root, "src/a.ts", "export const original = 1;");

@@ -67,12 +67,22 @@ export class FakeStore {
     this.tables.set(name, rows.filter((r) => !pathSet.has(r.relativePath)));
   }
 
+  async retainRelativePaths(name: string, keepPaths: Set<string>): Promise<void> {
+    const rows = this.tables.get(name);
+    if (!rows) return;
+    this.tables.set(name, rows.filter((r) => keepPaths.has(r.relativePath)));
+  }
+
   async dropTable(name: string): Promise<void> {
     this.tables.delete(name);
   }
 
   async getRowCount(name: string): Promise<number> {
     return this.tables.get(name)?.length ?? 0;
+  }
+
+  async getAllRelativePaths(name: string): Promise<string[]> {
+    return [...new Set((this.tables.get(name) ?? []).map((row) => row.relativePath))];
   }
 
   async search(

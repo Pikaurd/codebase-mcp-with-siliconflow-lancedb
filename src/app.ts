@@ -39,6 +39,18 @@ export interface StatusResponse {
   codebase?: CodebaseRecord;
 }
 
+export interface DashboardJob {
+  id: string; path: string; kind: IndexJob["kind"]; state: IndexJob["state"];
+  createdAt: string; startedAt?: string; completedAt?: string;
+  processedFiles: number; totalFiles: number; currentFile?: string; totalChunks: number;
+  failureCode?: IndexJob["failureCode"]; failureMessage?: string;
+}
+
+export interface DashboardSnapshot {
+  runningCount: number; queuedCount: number; maxConcurrency: number;
+  activeJobs: DashboardJob[]; recentJobs: DashboardJob[];
+}
+
 export class CodebaseService {
   private constructor(
     private readonly config: ServiceConfig,
@@ -105,7 +117,23 @@ export class CodebaseService {
         : results.filter((result) => extensionFilter.some(
           (extension) => extension.toLowerCase() === result.fileExtension.toLowerCase(),
         ));
-      return { path: canonicalPath, results: filtered, indexStatus: codebase.status };
+      const bestByOverlap = new Map<string, SearchResult>();
+      for (const result of filtered) {
+        const key = `${result.relativePath}:${result.startLine}-${result.endLine}`;
+        const previous = bestByOverlap.get(key);
+        if (!previous || result.score > previous.score) bestByOverlap.set(key, result);
+      }
+      const perFile = new Map<string, SearchResult[]>();
+      for (const result of bestByOverlap.values()) {
+        const items = perFile.get(result.relativePath) ?? [];
+        if (items.length < 2) items.push(result);
+        perFile.set(result.relativePath, items);
+      }
+      return {
+        path: canonicalPath,
+        results: [...perFile.values()].flat().sort((a, b) => b.score - a.score).slice(0, limit),
+        indexStatus: codebase.status,
+      };
     });
   }
 
@@ -141,8 +169,27 @@ export class CodebaseService {
     return this.scheduler.shutdown();
   }
 
+  getDashboardSnapshot(): DashboardSnapshot {
+    const { activeJobs, recentJobs } = this.repository.listDashboardJobs();
+    const toDashboardJob = (job: IndexJob): DashboardJob => {
+      const { options: _options, ...safeJob } = job;
+      return safeJob;
+    };
+    return {
+      runningCount: activeJobs.filter((job) => job.state === "running").length,
+      queuedCount: activeJobs.filter((job) => job.state === "queued").length,
+      maxConcurrency: this.config.indexMaxConcurrency,
+      activeJobs: activeJobs.map(toDashboardJob),
+      recentJobs: recentJobs.map(toDashboardJob),
+    };
+  }
+
   async runIndexJob(job: IndexJob): Promise<{ processedFiles: number; totalChunks: number }> {
-    if (job.kind === "clear") return this.indexer.clear(job.path);
+    if (job.kind === "clear") {
+      const statistics = { processedFiles: 0, totalFiles: 0, totalChunks: 0 };
+      this.repository.updateJobStatistics(job.id, statistics);
+      return this.indexer.clear(job.path);
+    }
 
     let options: IndexOptions;
     try {

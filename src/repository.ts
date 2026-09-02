@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { ServiceError, toMcpError } from "./errors.js";
 import type { ServiceErrorCode } from "./types.js";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export type IndexJobKind = "index" | "force" | "clear";
 export type IndexJobState =
@@ -30,6 +30,8 @@ export interface IndexJob {
   startedAt?: string;
   completedAt?: string;
   processedFiles: number;
+  totalFiles: number;
+  currentFile?: string;
   totalChunks: number;
   failureCode?: ServiceErrorCode;
   failureMessage?: string;
@@ -38,6 +40,8 @@ export interface IndexJob {
 export interface JobStatistics {
   processedFiles: number;
   totalChunks: number;
+  totalFiles?: number;
+  currentFile?: string;
 }
 
 export interface TransitionJobUpdate {
@@ -75,6 +79,8 @@ interface JobRow {
   started_at: string | null;
   completed_at: string | null;
   processed_files: number;
+  total_files: number;
+  current_file: string | null;
   total_chunks: number;
   failure_code: ServiceErrorCode | null;
   failure_message: string | null;
@@ -130,6 +136,8 @@ function toIndexJob(row: JobRow): IndexJob {
     startedAt: row.started_at ?? undefined,
     completedAt: row.completed_at ?? undefined,
     processedFiles: row.processed_files,
+    totalFiles: row.total_files,
+    currentFile: row.current_file ?? undefined,
     totalChunks: row.total_chunks,
     failureCode: row.failure_code ?? undefined,
     failureMessage: row.failure_message ?? undefined,
@@ -172,7 +180,7 @@ export class MetadataRepository {
   findActiveJob(path: string, kind: IndexJobKind, options: string): IndexJob | undefined {
     const row = this.db.prepare(
       `SELECT id, path, kind, state, options, created_at, started_at, completed_at,
-              processed_files, total_chunks, failure_code, failure_message
+              processed_files, total_files, current_file, total_chunks, failure_code, failure_message
        FROM index_jobs
        WHERE path = ? AND kind = ? AND options_key = ? AND state IN ('queued', 'running')
        ORDER BY created_at ASC
@@ -200,6 +208,8 @@ export class MetadataRepository {
              started_at = CASE WHEN ? = 'running' THEN ? ELSE started_at END,
              completed_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled', 'interrupted') THEN ? ELSE completed_at END,
              processed_files = COALESCE(?, processed_files),
+             total_files = COALESCE(?, total_files),
+             current_file = COALESCE(?, current_file),
              total_chunks = COALESCE(?, total_chunks),
              failure_code = ?,
              failure_message = ?
@@ -212,6 +222,8 @@ export class MetadataRepository {
         state,
         updatedAt,
         update.statistics?.processedFiles ?? null,
+        update.statistics?.totalFiles ?? null,
+        update.statistics?.currentFile ?? null,
         update.statistics?.totalChunks ?? null,
         failure?.code ?? null,
         failure?.message ?? null,
@@ -244,7 +256,7 @@ export class MetadataRepository {
   getJob(id: string): IndexJob | undefined {
     const row = this.db.prepare(
       `SELECT id, path, kind, state, options, created_at, started_at, completed_at,
-              processed_files, total_chunks, failure_code, failure_message
+              processed_files, total_files, current_file, total_chunks, failure_code, failure_message
        FROM index_jobs WHERE id = ?`,
     ).get(id) as JobRow | undefined;
     return row && toIndexJob(row);
@@ -253,7 +265,7 @@ export class MetadataRepository {
   getLatestJob(path: string): IndexJob | undefined {
     const row = this.db.prepare(
       `SELECT id, path, kind, state, options, created_at, started_at, completed_at,
-              processed_files, total_chunks, failure_code, failure_message
+              processed_files, total_files, current_file, total_chunks, failure_code, failure_message
        FROM index_jobs WHERE path = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
     ).get(path) as JobRow | undefined;
     return row && toIndexJob(row);
@@ -270,12 +282,36 @@ export class MetadataRepository {
       }
       this.db.prepare(
         `UPDATE index_jobs
-         SET processed_files = ?, total_chunks = ?, updated_at = ?
+         SET processed_files = ?, total_files = COALESCE(?, total_files),
+             current_file = ?, total_chunks = ?, updated_at = ?
          WHERE id = ?`,
-      ).run(statistics.processedFiles, statistics.totalChunks, now(), id);
+      ).run(
+        statistics.processedFiles,
+        statistics.totalFiles ?? null,
+        statistics.currentFile ?? null,
+        statistics.totalChunks,
+        now(),
+        id,
+      );
       return this.getJob(id)!;
     });
     return update();
+  }
+
+  listDashboardJobs(): { activeJobs: IndexJob[]; recentJobs: IndexJob[] } {
+    const select = `SELECT id, path, kind, state, options, created_at, started_at, completed_at,
+                           processed_files, total_files, current_file, total_chunks,
+                           failure_code, failure_message
+                    FROM index_jobs`;
+    const activeRows = this.db.prepare(
+      `${select} WHERE state IN ('queued', 'running')
+       ORDER BY CASE state WHEN 'running' THEN 0 ELSE 1 END, created_at ASC, rowid ASC`,
+    ).all() as JobRow[];
+    const recentRows = this.db.prepare(
+      `${select} WHERE state IN ('completed', 'failed', 'cancelled', 'interrupted')
+       ORDER BY completed_at DESC, rowid DESC LIMIT 20`,
+    ).all() as JobRow[];
+    return { activeJobs: activeRows.map(toIndexJob), recentJobs: recentRows.map(toIndexJob) };
   }
 
   upsertCodebase(input: UpsertCodebaseInput): void {
@@ -324,6 +360,22 @@ export class MetadataRepository {
       }
     });
     replace();
+  }
+
+  /** Records or refreshes the hash of a single processed file. */
+  upsertFileHash(path: string, relativePath: string, contentHash: string): void {
+    this.db.prepare(
+      `INSERT INTO file_hashes (codebase_path, relative_path, content_hash)
+       VALUES (?, ?, ?)
+       ON CONFLICT(codebase_path, relative_path) DO UPDATE SET content_hash = excluded.content_hash`,
+    ).run(path, relativePath, contentHash);
+  }
+
+  /** Removes the persisted hash of a deleted file. */
+  removeFileHash(path: string, relativePath: string): void {
+    this.db.prepare(
+      "DELETE FROM file_hashes WHERE codebase_path = ? AND relative_path = ?",
+    ).run(path, relativePath);
   }
 
   getFileHashes(path: string): Record<string, string> {
@@ -450,6 +502,13 @@ export class MetadataRepository {
           ALTER TABLE index_jobs ADD COLUMN failure_message TEXT;
         `);
         this.db.pragma("user_version = 2");
+      }
+      if (currentVersion < 3) {
+        this.db.exec(`
+          ALTER TABLE index_jobs ADD COLUMN total_files INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE index_jobs ADD COLUMN current_file TEXT;
+        `);
+        this.db.pragma("user_version = 3");
       }
     })();
   }

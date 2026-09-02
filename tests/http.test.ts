@@ -8,6 +8,7 @@ import * as path from "node:path";
 import type { Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { closeHttpServer, createHttpServer } from "../src/http.js";
+import { dashboardHtml } from "../src/dashboard.js";
 import { MetadataRepository } from "../src/repository.js";
 import type { ServiceConfig } from "../src/types.js";
 import {
@@ -567,4 +568,40 @@ describe("local Streamable HTTP MCP", () => {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }
   }, 10_000);
+});
+
+describe("Dashboard", () => {
+  it("serves a non-sensitive shell with client-side polling", async () => {
+    const { baseUrl, service } = await start();
+    const response = await fetch(`${baseUrl}/dashboard`);
+    const html = await response.text();
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(html).toContain("LOCAL_AUTH_TOKEN");
+    expect(html).toContain("2000");
+    expect(html).toContain("textContent");
+    expect(html).not.toContain(TOKEN);
+    expect(html).not.toContain(SECRET);
+    expect(html).not.toContain(service.root);
+    expect(html).not.toContain("sessionStorage");
+    expect(dashboardHtml()).toBe(html);
+  });
+
+  it("protects the jobs API and returns a redacted dashboard snapshot", async () => {
+    const { baseUrl, service } = await start();
+    const job = service.repository.createJob({ id: "dashboard-job", path: service.root, kind: "index", options: `{"secret":"${SECRET}"}` });
+    service.repository.transitionJob(job.id, "running");
+
+    const unauthorized = await fetch(`${baseUrl}/api/dashboard/jobs`);
+    expect(unauthorized.status).toBe(401);
+    const badOrigin = await fetch(`${baseUrl}/api/dashboard/jobs`, { headers: { origin: "https://evil.example" } });
+    expect(badOrigin.status).toBe(403);
+    const response = await fetch(`${baseUrl}/api/dashboard/jobs`, { headers: { authorization: `Bearer ${TOKEN}` } });
+    const body = await responseBody(response);
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ runningCount: 1, queuedCount: 0, maxConcurrency: 2 });
+    expect(body.activeJobs[0]).toMatchObject({ id: job.id, path: service.root, state: "running" });
+    expect(JSON.stringify(body)).not.toContain("options");
+    expect(JSON.stringify(body)).not.toContain(SECRET);
+  });
 });

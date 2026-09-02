@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { CodebaseService } from "./app.js";
+import { dashboardHtml } from "./dashboard.js";
 import { ServiceError, toMcpError } from "./errors.js";
 import { createMcpServer, withMcpRequestId } from "./mcp.js";
 import type { McpError, ServiceConfig, ServiceErrorCode } from "./types.js";
@@ -99,6 +100,20 @@ export function createHttpServer(app: CodebaseService, config: ServiceConfig): S
 
   web.get("/healthz", (_request, response) => {
     response.json({ status: "ok" });
+  });
+
+  web.get("/dashboard", (_request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    response.type("html").send(dashboardHtml());
+  });
+
+  web.get("/api/dashboard/jobs", (request, response) => {
+    if (!sameSecret(request.headers.authorization, config.localAuthToken)) {
+      securityFailure(response, correlationId(request), 401);
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.json(app.getDashboardSnapshot());
   });
 
   web.use("/mcp", (request, response, next) => {

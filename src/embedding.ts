@@ -3,6 +3,8 @@ import type { EmbeddingResult } from "./types.js";
 
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1000;
+const DEFAULT_BATCH_SIZE = 50;
+const DEFAULT_TIMEOUT_MS = 60_000;
 
 function isRetryable(err: unknown): boolean {
   if (err && typeof err === "object") {
@@ -12,7 +14,7 @@ function isRetryable(err: unknown): boolean {
     // Server errors
     if (typeof e.status === "number" && e.status >= 500) return true;
     // Network errors (no status)
-    if (e.status === undefined && e.code !== undefined) return true;
+    if (e.status === undefined && (e.code !== undefined || e.name === "TimeoutError" || e.name === "APIConnectionTimeoutError")) return true;
   }
   return false;
 }
@@ -28,14 +30,28 @@ export class EmbeddingProvider {
 
   constructor() {
     this.model = process.env.EMBEDDING_MODEL || "BAAI/bge-m3";
+    const timeout = Number(process.env.EMBEDDING_TIMEOUT_MS) > 0 ? Number(process.env.EMBEDDING_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS;
     this.client = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY || "",
       baseURL: process.env.OPENAI_BASE_URL || "https://api.siliconflow.cn/v1",
+      timeout,
     });
   }
 
   async embed(texts: string[]): Promise<EmbeddingResult[]> {
+    if (texts.length === 0) return [];
     const cleaned = texts.map((t) => (t.trim() === "" ? " " : t));
+    const configuredBatch = Number(process.env.EMBEDDING_BATCH_SIZE);
+    const batchSize = configuredBatch > 0 ? Math.floor(configuredBatch) : DEFAULT_BATCH_SIZE;
+    const all: EmbeddingResult[] = [];
+    for (let offset = 0; offset < cleaned.length; offset += batchSize) {
+      const batch = cleaned.slice(offset, offset + batchSize);
+      all.push(...await this.embedBatch(batch));
+    }
+    return all;
+  }
+
+  private async embedBatch(cleaned: string[]): Promise<EmbeddingResult[]> {
 
     let lastError: unknown;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -52,6 +68,7 @@ export class EmbeddingProvider {
         if (this._dimension === null && results.length > 0) {
           this._dimension = results[0].dimension;
         }
+        if (results.length !== cleaned.length) throw new Error("Embedding provider returned an unexpected result count");
         return results;
       } catch (err) {
         lastError = err;

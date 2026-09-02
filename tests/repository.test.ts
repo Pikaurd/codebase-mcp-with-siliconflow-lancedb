@@ -64,6 +64,24 @@ describe("MetadataRepository", () => {
     expect(repository.getFileHashes("/repo")).toEqual({ "new.ts": "new-hash" });
   });
 
+  it("upserts and removes single file hashes incrementally", () => {
+    const repository = MetadataRepository.open(createDatabasePath());
+    repository.upsertFileHash("/repo", "src/a.ts", "hash-a");
+    repository.upsertFileHash("/repo", "src/b.ts", "hash-b");
+
+    // Re-processing a file refreshes its hash in place
+    repository.upsertFileHash("/repo", "src/a.ts", "hash-a2");
+
+    expect(repository.getFileHashes("/repo")).toEqual({
+      "src/a.ts": "hash-a2",
+      "src/b.ts": "hash-b",
+    });
+
+    repository.removeFileHash("/repo", "src/a.ts");
+
+    expect(repository.getFileHashes("/repo")).toEqual({ "src/b.ts": "hash-b" });
+  });
+
   it("rolls back hash replacement when a later insert fails", () => {
     const dbPath = createDatabasePath();
     const repository = MetadataRepository.open(dbPath);
@@ -157,5 +175,34 @@ describe("MetadataRepository", () => {
       failureMessage: "Indexing failed",
     });
     expect(JSON.stringify(restored)).not.toContain("sk-test");
+  });
+
+  it("lists active jobs and limits recent terminal jobs", () => {
+    const repository = MetadataRepository.open(createDatabasePath());
+    repository.createJob({ id: "active", path: "/repo", kind: "index", options: "{}" });
+    repository.transitionJob("active", "running");
+    repository.updateJobStatistics("active", {
+      processedFiles: 1,
+      totalFiles: 3,
+      currentFile: "src/a.ts",
+      totalChunks: 8,
+    });
+    for (let index = 0; index < 21; index += 1) {
+      const id = `done-${index}`;
+      repository.createJob({ id, path: "/repo", kind: "clear", options: "{}" });
+      repository.transitionJob(id, "running");
+      repository.transitionJob(id, "completed", {
+        statistics: { processedFiles: 0, totalFiles: 0, totalChunks: 0 },
+      });
+    }
+
+    const snapshot = repository.listDashboardJobs();
+    expect(snapshot.activeJobs).toHaveLength(1);
+    expect(snapshot.activeJobs[0]).toMatchObject({
+      id: "active",
+      totalFiles: 3,
+      currentFile: "src/a.ts",
+    });
+    expect(snapshot.recentJobs).toHaveLength(20);
   });
 });

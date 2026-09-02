@@ -30,6 +30,16 @@ describe("canonicalizeAllowedPath", () => {
     );
   });
 
+  it("canonicalizes a symlink alias to the same collection path", async () => {
+    const root = createTemporaryDirectory();
+    const target = path.join(root, "target");
+    const alias = path.join(root, "alias");
+    fs.mkdirSync(target);
+    fs.symlinkSync(target, alias, "dir");
+
+    await expect(canonicalizeAllowedPath(alias, [root])).resolves.toBe(fs.realpathSync(target));
+  });
+
   it("rejects a path that does not exist with an actionable PATH_NOT_FOUND error", async () => {
     const root = createTemporaryDirectory();
 

@@ -4,11 +4,14 @@ import type { Document, SearchResult } from "./types.js";
 
 export interface VectorStoreLike {
   insert(name: string, documents: Document[]): Promise<void>;
+  prepareTable(name: string): Promise<void>;
   replaceByRelativePath(name: string, relativePath: string, documents: Document[]): Promise<void>;
   deleteByRelativePaths(name: string, relativePaths: string[]): Promise<void>;
+  retainRelativePaths(name: string, keepPaths: Set<string>): Promise<void>;
   dropTable(name: string): Promise<void>;
   hasTable(name: string): Promise<boolean>;
   getRowCount(name: string): Promise<number>;
+  getAllRelativePaths(name: string): Promise<string[]>;
   search(
     name: string,
     queryVector: number[],
@@ -116,16 +119,10 @@ export class LanceDBStore {
       return;
     }
     const table = await db.openTable(name);
-    if (documents.length === 0) {
-      await table.delete(this.idPrefixFilter(relativePath));
-      return;
+    await this.deleteByRelativePaths(name, [relativePath]);
+    if (documents.length > 0) {
+      await (await db.openTable(name)).add(this.recordsFor(documents) as lancedb.Data);
     }
-    await table
-      .mergeInsert("id")
-      .whenMatchedUpdateAll()
-      .whenNotMatchedInsertAll()
-      .whenNotMatchedBySourceDelete({ where: this.idPrefixFilter(relativePath) })
-      .execute(this.recordsFor(documents) as lancedb.Data);
   }
 
   private recordsFor(documents: Document[]): Array<Record<string, unknown>> {
@@ -151,7 +148,7 @@ export class LanceDBStore {
   private async documentsByRelativePath(name: string, relativePath: string): Promise<Document[]> {
     if (!(await this.hasTable(name))) return [];
     const table = await this.ensureConnected().openTable(name);
-    const rows = await table.query().toArray();
+    const rows = await table.query().limit(Number.MAX_SAFE_INTEGER).toArray();
     return rows
       .filter((row: Record<string, unknown>) => row.relativePath === relativePath)
       .map((row: Record<string, unknown>) => ({
@@ -177,21 +174,21 @@ export class LanceDBStore {
     const tbl = await db.openTable(name);
 
     // Vector search
-    const vectorResults = await tbl
-      .search(queryVector)
-      .limit(limit)
-      .toArray();
+    const candidateLimit = Math.max(limit * 2, 20);
+    const vectorResults = await tbl.search(queryVector).limit(candidateLimit).toArray();
 
     // Hybrid: merge with FTS results (RRF-style ranking)
     // If FTS is available, we do a separate FTS search and merge
     let ftsScores = new Map<string, number>();
+    const ftsResultsCache = new Map<string, Record<string, unknown>>();
     let ftsWorked = false;
     try {
-      const ftsResults = await tbl.search(queryText).limit(limit).toArray();
+      const ftsResults = await tbl.search(queryText).limit(candidateLimit).toArray();
       ftsWorked = ftsResults.length > 0;
       if (ftsWorked) {
         ftsResults.forEach((r: Record<string, unknown>, i: number) => {
           const id = r.id as string;
+          ftsResultsCache.set(id, r);
           const rankScore = 1 / (60 + i + 1); // RRF k=60
           ftsScores.set(id, rankScore);
         });
@@ -200,18 +197,26 @@ export class LanceDBStore {
       // FTS might not be available; vector-only results are fine
     }
 
-    const vectorWeight = 1.0;
-    const ftsWeight = ftsWorked ? 0.0 : 0.0;
+    const FTS_WEIGHT = 15;
     const scoreThreshold = 0.15;
 
-    const results: SearchResult[] = vectorResults.map(
-      (r: Record<string, unknown>, i: number) => {
+    const vectorScores = new Map<string, number>();
+    vectorResults.forEach((r: Record<string, unknown>) => {
+      const distance = (r._distance as number) ?? 0;
+      vectorScores.set(r.id as string, 1 - distance / 2);
+    });
+    const rows = new Map<string, Record<string, unknown>>();
+    vectorResults.forEach((r: Record<string, unknown>) => rows.set(r.id as string, r));
+    if (ftsWorked) ftsScores.forEach((_, id) => {
+      const row = ftsResultsCache.get(id);
+      if (row) rows.set(id, row);
+    });
+    const results: SearchResult[] = [...rows.values()].map(
+      (r: Record<string, unknown>) => {
         const id = r.id as string;
-        const l2Dist = (r._distance as number) ?? 0;
-        const vectorScore = 1 - l2Dist / 2;
+        const vectorScore = vectorScores.get(id) ?? 0;
         const ftsScore = ftsScores.get(id) || 0;
-        const ftsBonus = ftsWorked ? ftsScore * 5 : 0;
-        const finalScore = vectorScore * vectorWeight + ftsBonus;
+        const finalScore = vectorScore + FTS_WEIGHT * ftsScore;
 
         let metadata: Record<string, unknown> = {};
         try {
@@ -233,7 +238,6 @@ export class LanceDBStore {
 
     return results
       .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
       .filter((r) => r.score > scoreThreshold);
   }
 
@@ -289,7 +293,7 @@ export class LanceDBStore {
 
     // Fallback: full table rebuild
     const pathSet = new Set(relativePaths);
-    const all = await tbl.query().toArray();
+    const all = await tbl.query().limit(Number.MAX_SAFE_INTEGER).toArray();
     const filtered = all.filter(
       (r: Record<string, unknown>) => !pathSet.has(r.relativePath as string)
     );
@@ -339,7 +343,11 @@ export class LanceDBStore {
     try {
       const db = this.ensureConnected();
       const tbl = await db.openTable(name);
-      const all = await tbl.query().toArray();
+      // NOTE: `.query().toArray()` without an explicit limit returns only the
+      // first 10 rows (LanceDB's default query limit). A full scan needs an
+      // explicit limit; getAllRelativePaths is used by orphan reconcile, so a
+      // truncated scan would silently miss orphaned files.
+      const all = await tbl.query().limit(Number.MAX_SAFE_INTEGER).toArray();
       return [...new Set(all.map((r: Record<string, unknown>) => r.relativePath as string))];
     } catch {
       return [];
@@ -349,6 +357,33 @@ export class LanceDBStore {
   async listTables(): Promise<string[]> {
     const db = this.ensureConnected();
     return db.tableNames();
+  }
+
+  /**
+   * Drop+recreate the table keeping only rows whose relativePath is in the
+   * keep set. Much faster than deleteByRelativePaths when the orphan set is
+   * large — O(total rows) scan once + recreate, instead of O(orphans × versions)
+   * of per-path deletes.
+   */
+  async retainRelativePaths(name: string, keepPaths: Set<string>): Promise<void> {
+    const db = this.ensureConnected();
+    const tbl = await db.openTable(name);
+    const all = await tbl.query().limit(Number.MAX_SAFE_INTEGER).toArray();
+    const filtered = all.filter(
+      (r: Record<string, unknown>) => keepPaths.has(r.relativePath as string),
+    );
+    await db.dropTable(name);
+    if (filtered.length > 0) {
+      const newTbl = await db.createTable(name, filtered as lancedb.Data);
+      try {
+        await newTbl.createIndex("text", {
+          config: lancedb.Index.fts(),
+          replace: true,
+        });
+      } catch { }
+    } else {
+      await db.createTable(name, [], { mode: "create" });
+    }
   }
 
   getDbPath(): string {

@@ -194,54 +194,132 @@ export class Indexer {
         changed = await synchronizer.discoverFiles();
         const current = new Set(changed.map((filePath) => path.relative(codebasePath, filePath)));
         removed = Object.keys(hashes).filter((relativePath) => !current.has(relativePath));
+        // Force rebuild: start from an empty table so per-file replaceByRelativePath
+        // (delete + add) doesn't scan tens of thousands of stale rows on every file.
+        await store.prepareTable(collectionName);
       } else {
         ({ changed, removed } = await synchronizer.detectChanges());
       }
+      const discovered = new Set(
+        (options.force || !hasTable ? changed : await synchronizer.discoverFiles())
+          .map((filePath) => path.relative(codebasePath, filePath)),
+      );
 
+      const isFullRebuild = options.force || !hasTable;
       let failedFiles = 0;
       totalChunks = hasTable ? Math.max(0, await store.getRowCount(collectionName)) : 0;
+      const totalFiles = removed.length + changed.length;
+      onProgress({ processedFiles, totalFiles, totalChunks });
 
-      for (const relativePath of removed) {
-        try {
-          this.ensureJobRunning(completedJobId);
-          await this.access.write(
-            codebasePath,
-            () => store.deleteByRelativePaths(collectionName, [relativePath]),
-          );
-          this.ensureJobRunning(completedJobId);
-          synchronizer.removeHash(relativePath);
-          repository.replaceFileHashes(codebasePath, synchronizer.getHashes());
-          totalChunks = Math.max(0, await store.getRowCount(collectionName));
-          onProgress({ processedFiles, totalChunks });
-        } catch {
-          // Keep the hash so deletion is retried by a later incremental job.
-          failedFiles += 1;
+      if (!isFullRebuild) {
+        for (const relativePath of removed) {
+          try {
+            this.ensureJobRunning(completedJobId);
+            onProgress({ processedFiles, totalFiles, totalChunks, currentFile: relativePath });
+            await this.access.write(
+              codebasePath,
+              () => store.deleteByRelativePaths(collectionName, [relativePath]),
+            );
+            this.ensureJobRunning(completedJobId);
+            synchronizer.removeHash(relativePath);
+            repository.removeFileHash(codebasePath, relativePath);
+          } catch {
+            // Keep the hash so deletion is retried by a later incremental job.
+            failedFiles += 1;
+          } finally {
+            processedFiles += 1;
+            onProgress({ processedFiles, totalFiles, totalChunks, currentFile: relativePath });
+          }
         }
       }
 
-      for (const filePath of changed) {
-        const relativePath = path.relative(codebasePath, filePath);
-        try {
-          const content = await synchronizer.readFile(filePath);
-          const chunks = splitCode(content, filePath, codebasePath);
-          const embeddings = await embedding.embed(chunks.map((chunk) => chunk.content));
-          const documents = toDocuments(chunks, embeddings, codebasePath);
-
-          this.ensureJobRunning(completedJobId);
-          await this.access.write(
-            codebasePath,
-            () => store.replaceByRelativePath(collectionName, relativePath, documents),
+      // Provider rate-limits aggressively under concurrency (429s observed
+      // with 5 parallel embed calls); 2 keeps throughput while staying under
+      // the limit. Override with INDEX_EMBED_CONCURRENCY if needed.
+      const configuredConcurrency = Number(process.env.INDEX_EMBED_CONCURRENCY);
+      const EMBED_CONCURRENCY = configuredConcurrency > 0 ? Math.floor(configuredConcurrency) : 2;
+      // Stage 1 (parallel, bounded): read + split + embed for up to 5 files at a
+      // time. Pure per-file work with no shared state — the embedding provider
+      // round-trip dominates wall time, so files wait on the network instead of
+      // on each other. Failures are captured per file and resolved serially below.
+      const prepared = new Map<string, Promise<
+        { documents: Document[]; contentHash: string } | { error: unknown }
+      >>();
+      const pending = [...changed];
+      let nextIndex = 0;
+      const startNext = (): void => {
+        while (prepared.size < EMBED_CONCURRENCY && nextIndex < pending.length) {
+          const filePath = pending[nextIndex];
+          nextIndex += 1;
+          const relativePath = path.relative(codebasePath, filePath);
+          onProgress({ processedFiles, totalFiles, totalChunks, currentFile: relativePath });
+          prepared.set(
+            filePath,
+            (async () => {
+              try {
+                const content = await synchronizer.readFile(filePath);
+                const chunks = splitCode(content, filePath, codebasePath);
+                const embeddings = await embedding.embed(chunks.map((chunk) => chunk.content));
+                return { documents: toDocuments(chunks, embeddings, codebasePath), contentHash: synchronizer.hashContent(content) };
+              } catch (error) {
+                return { error };
+              }
+            })(),
           );
+        }
+      };
+      startNext();
+
+      // Full rebuild: the table was cleared by prepareTable, so per-file
+      // replaceByRelativePath (delete + add) is both pointless and harmful —
+      // every add creates a LanceDB version, and delete scans fragment
+      // versions, degrading from ~3ms to ~900ms per file as versions pile up.
+      // Collect prepared documents and commit in large batched adds instead.
+      const batched: Document[] = [];
+      // Incremental: keep the original per-file replace so a failed file
+      // retains its previously committed chunks and hash (unchanged semantics).
+      while (prepared.size > 0) {
+        const settled = await Promise.race(
+          [...prepared.entries()].map(async ([filePath, work]) => ({ filePath, result: await work })),
+        );
+        prepared.delete(settled.filePath);
+        startNext();
+        const relativePath = path.relative(codebasePath, settled.filePath);
+        try {
+          if ("error" in settled.result) throw settled.result.error;
+          const { documents, contentHash } = settled.result;
           this.ensureJobRunning(completedJobId);
-          synchronizer.updateHash(relativePath, synchronizer.hashContent(content));
-          repository.replaceFileHashes(codebasePath, synchronizer.getHashes());
-          processedFiles += 1;
-          totalChunks = Math.max(0, await store.getRowCount(collectionName));
-          onProgress({ processedFiles, totalChunks });
+          if (isFullRebuild) {
+            batched.push(...documents);
+          } else {
+            await this.access.write(
+              codebasePath,
+              () => store.replaceByRelativePath(collectionName, relativePath, documents),
+            );
+          }
+          this.ensureJobRunning(completedJobId);
+          synchronizer.updateHash(relativePath, contentHash);
+          repository.upsertFileHash(codebasePath, relativePath, contentHash);
         } catch {
           // A failed file deliberately retains its previously committed chunks and hash.
           failedFiles += 1;
+        } finally {
+          processedFiles += 1;
+          onProgress({ processedFiles, totalFiles, totalChunks, currentFile: relativePath });
         }
+      }
+
+      // Commit the accumulated full-rebuild rows in one batched add.
+      if (isFullRebuild && batched.length > 0) {
+        this.ensureJobRunning(completedJobId);
+        await this.access.write(codebasePath, () => store.insert(collectionName, batched));
+        totalChunks = Math.max(0, await store.getRowCount(collectionName));
+      }
+      // Full rebuild: sync hashes now contain only successfully-processed
+      // changed files. Atomically replace sqlite file_hashes so old entries
+      // (files that were removed since the last index) are cleaned up.
+      if (isFullRebuild) {
+        repository.replaceFileHashes(codebasePath, synchronizer.getHashes());
       }
 
       if (failedFiles > 0) {
@@ -250,6 +328,22 @@ export class Indexer {
           "Indexing failed",
           "Retry indexing or check service logs with the request ID",
         );
+      }
+
+      const indexedPaths = await store.getAllRelativePaths(collectionName);
+      const orphanPaths = indexedPaths.filter((relativePath) => !discovered.has(relativePath));
+      if (orphanPaths.length > 0) {
+        await this.access.write(codebasePath, async () => {
+          // For large orphan sets the per-path id LIKE deletion creates
+          // hundreds of LanceDB versions at ~8k rows/minute. Drop+recreate
+          // is O(n) instead of O(orphans × versions) — run it for >50.
+          if (orphanPaths.length > 50) {
+            await store.retainRelativePaths(collectionName, discovered);
+          } else {
+            await store.deleteByRelativePaths(collectionName, orphanPaths);
+          }
+        });
+        totalChunks = Math.max(0, await store.getRowCount(collectionName));
       }
 
       this.ensureJobRunning(completedJobId);
@@ -291,7 +385,7 @@ export class Indexer {
       await this.dependencies.store.dropTable(collectionName);
       this.dependencies.repository.deleteCodebase(codebasePath);
     });
-    return { processedFiles: 0, totalChunks: 0 };
+    return { processedFiles: 0, totalFiles: 0, totalChunks: 0 };
   }
 
   private ensureJobRunning(jobId: string | undefined): void {

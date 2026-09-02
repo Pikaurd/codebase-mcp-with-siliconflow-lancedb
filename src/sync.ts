@@ -42,6 +42,13 @@ const DEFAULT_IGNORE_PATTERNS = [
   "*.g.dart",
   "*.freezed.dart",
   "*.gr.dart",
+  ".venv",
+  "*.pb.dart",
+  "*.pbjson.dart",
+  "generated",
+  "**/resource/k.dart",
+  "assets/**/*.json",
+  ".flutter-plugins*",
   "*.g.yaml",
   // Assets (not code)
   "*.png",

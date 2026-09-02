@@ -454,22 +454,13 @@ describe("LanceDBStore file replacement", () => {
       codebasePath: "/repo",
     };
     await store.insert("collection", [oldDocument]);
-    const connection = Reflect.get(store, "db");
-    const table = await connection.openTable("collection");
-    const merge = {
-      whenMatchedUpdateAll: () => merge,
-      whenNotMatchedInsertAll: () => merge,
-      whenNotMatchedBySourceDelete: () => merge,
-      execute: vi.fn().mockRejectedValue(new Error("controlled merge failure")),
-    };
-    vi.spyOn(connection, "openTable").mockResolvedValue(table);
-    vi.spyOn(table, "mergeInsert").mockReturnValue(merge);
+    vi.spyOn(store, "deleteByRelativePaths").mockRejectedValue(new Error("controlled delete failure"));
 
     await expect(store.replaceByRelativePath("collection", "src/a.ts", [{
       ...oldDocument,
       id: "src/a.ts:1-1:new",
       text: "export const replacement = 999;",
-    }])).rejects.toThrow("controlled merge failure");
+    }])).rejects.toThrow("controlled delete failure");
 
     const results = await store.search("collection", [1, 0, 0], "original", 10);
     expect(results.map(({ text }) => text)).toContain("export const original = 1;");
@@ -505,22 +496,12 @@ describe("LanceDBStore file replacement", () => {
     await store.insert("collection", [oldDocument]);
     const connection = Reflect.get(store, "db");
     const table = await connection.openTable("collection");
-    const committedMerge = table
-      .mergeInsert("id")
-      .whenMatchedUpdateAll()
-      .whenNotMatchedInsertAll()
-      .whenNotMatchedBySourceDelete({ where: "id LIKE 'src/a.ts:%'" });
-    const merge = {
-      whenMatchedUpdateAll: () => merge,
-      whenNotMatchedInsertAll: () => merge,
-      whenNotMatchedBySourceDelete: () => merge,
-      execute: vi.fn().mockImplementation(async (documents) => {
-        await committedMerge.execute(documents);
-        throw new Error("controlled post-commit failure");
-      }),
-    };
     vi.spyOn(connection, "openTable").mockResolvedValue(table);
-    vi.spyOn(table, "mergeInsert").mockReturnValue(merge);
+    const originalAdd = table.add.bind(table);
+    vi.spyOn(table, "add").mockImplementation(async (documents) => {
+      await originalAdd(documents);
+      throw new Error("controlled post-commit failure");
+    });
 
     await expect(store.replaceByRelativePath(
       "collection",

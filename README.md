@@ -58,6 +58,16 @@ curl http://127.0.0.1:3000/healthz
 # {"status":"ok"}
 ```
 
+### Dashboard
+
+Open `http://127.0.0.1:3000/dashboard` in a browser and enter the service's
+`LOCAL_AUTH_TOKEN` in the page. The Dashboard is local-only, refreshes every
+2 seconds, and shows running, queued, and recent jobs with file progress and
+sanitized failure details. The token is kept only in the current page's memory;
+refreshing or closing the page clears it. It is not placed in `sessionStorage`,
+the URL, cookies, or service logs.
+Jobs with no file work, including clear jobs, display `0/0` and 100% progress.
+
 ## Connect an MCP client
 
 Configure each local MCP client for Streamable HTTP:
