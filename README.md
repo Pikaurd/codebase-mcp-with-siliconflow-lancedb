@@ -83,6 +83,75 @@ For example, subsequent requests add `-H "MCP-Session-Id: <returned-session-id>"
 The service accepts only loopback requests whose `Host` (and, when supplied,
 `Origin`) matches its local address.
 
+## Configure common agents
+
+Start this service before configuring a client. Each client must run on the
+same machine and be able to reach its own `127.0.0.1:3000`. Export
+`LOCAL_AUTH_TOKEN` in the environment from which you start the client, using
+the same value used to start this service.
+
+### Claude Code
+
+Register the Streamable HTTP server from a shell that has
+`LOCAL_AUTH_TOKEN` set:
+
+```bash
+claude mcp add --transport http \
+   codebase-local http://127.0.0.1:3000/mcp \
+   --header "Authorization: Bearer $LOCAL_AUTH_TOKEN"
+```
+
+Use `claude mcp list` to confirm that `codebase-local` is registered. The
+command stores the supplied header in Claude Code's local MCP configuration;
+protect that configuration as a secret, or remove the server with
+`claude mcp remove codebase-local` when it is no longer needed.
+
+### Codex CLI
+
+Add the following to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.codebase-local]
+url = "http://127.0.0.1:3000/mcp"
+bearer_token_env_var = "LOCAL_AUTH_TOKEN"
+```
+
+Start Codex CLI from an environment with `LOCAL_AUTH_TOKEN` exported. Codex
+reads the token at runtime, so the token itself does not need to be written to
+the TOML file.
+
+### VS Code Copilot
+
+Create or update `.vscode/mcp.json` in the workspace, then use the MCP view
+to start the server. VS Code prompts for the token without adding it to the
+file:
+
+```json
+{
+   "servers": {
+      "codebase-local": {
+         "type": "http",
+         "url": "http://127.0.0.1:3000/mcp",
+         "headers": {
+            "Authorization": "Bearer ${input:codebase-mcp-token}"
+         }
+      }
+   },
+   "inputs": [
+      {
+         "id": "codebase-mcp-token",
+         "type": "promptString",
+         "description": "Codebase MCP local authentication token",
+         "password": true
+      }
+   ]
+}
+```
+
+Enter the value of `LOCAL_AUTH_TOKEN` when VS Code asks. Do not commit a
+literal token in `.vscode/mcp.json`; add the file to local ignore rules when
+it contains client-specific configuration.
+
 ## Index and search
 
 Use the connected client's tools in this order:
