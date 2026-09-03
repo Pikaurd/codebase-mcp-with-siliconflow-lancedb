@@ -5,6 +5,7 @@ const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1000;
 const DEFAULT_BATCH_SIZE = 50;
 const DEFAULT_TIMEOUT_MS = 60_000;
+const CLOUDFLARE_AI_RUN_PREFIX = "/ai/run/";
 
 function isRetryable(err: unknown): boolean {
   if (err && typeof err === "object") {
@@ -23,19 +24,50 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Wrapped error so its shape matches what catch() and isRetryable expect. */
+class EmbeddingHttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "EmbeddingHttpError";
+    this.status = status;
+  }
+}
+
+/**
+ * Whether the configured base URL points to Cloudflare's /ai/run/ (native
+ * Workers AI) endpoint. When true, we bypass the OpenAI SDK and call the
+ * native API directly.
+ */
+function isCloudflareNative(): boolean {
+  return (process.env.OPENAI_BASE_URL ?? "").includes(CLOUDFLARE_AI_RUN_PREFIX);
+}
+
 export class EmbeddingProvider {
   private client: OpenAI;
   private model: string;
   private _dimension: number | null = null;
+  private baseUrl: string;
+  private apiKey: string;
+  private cloudflareNative: boolean;
 
   constructor() {
     this.model = process.env.EMBEDDING_MODEL || "BAAI/bge-m3";
-    const timeout = Number(process.env.EMBEDDING_TIMEOUT_MS) > 0 ? Number(process.env.EMBEDDING_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS;
-    this.client = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY || "",
-      baseURL: process.env.OPENAI_BASE_URL || "https://api.siliconflow.cn/v1",
-      timeout,
-    });
+    this.baseUrl = process.env.OPENAI_BASE_URL || "https://api.siliconflow.cn/v1";
+    this.apiKey = process.env.OPENAI_API_KEY || "";
+    this.cloudflareNative = isCloudflareNative();
+    if (this.cloudflareNative) {
+      // OpenAI SDK won't be used — satisfying constructor only.
+      this.client = null as unknown as OpenAI;
+    } else {
+      const timeout = Number(process.env.EMBEDDING_TIMEOUT_MS) > 0
+        ? Number(process.env.EMBEDDING_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS;
+      this.client = new OpenAI({
+        apiKey: this.apiKey,
+        baseURL: this.baseUrl,
+        timeout,
+      });
+    }
   }
 
   async embed(texts: string[]): Promise<EmbeddingResult[]> {
@@ -52,7 +84,14 @@ export class EmbeddingProvider {
   }
 
   private async embedBatch(cleaned: string[]): Promise<EmbeddingResult[]> {
+    if (this.cloudflareNative) {
+      return this.cloudflareEmbedBatch(cleaned);
+    }
+    return this.openaiEmbedBatch(cleaned);
+  }
 
+  /** OpenAI-compatible (OpenAI, SiliconFlow, Cloudflare compat, etc). */
+  private async openaiEmbedBatch(cleaned: string[]): Promise<EmbeddingResult[]> {
     let lastError: unknown;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -86,6 +125,73 @@ export class EmbeddingProvider {
     throw lastError;
   }
 
+  /** Cloudflare Workers AI native /ai/run/ endpoint. */
+  private async cloudflareEmbedBatch(cleaned: string[]): Promise<EmbeddingResult[]> {
+    let lastError: unknown;
+    const url = `${this.baseUrl}${this.model}`;
+    const timeoutMs = Number(process.env.EMBEDDING_TIMEOUT_MS) > 0
+      ? Number(process.env.EMBEDDING_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${this.apiKey}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ text: cleaned }),
+            signal: controller.signal,
+          });
+          if (!resp.ok) {
+            const body = await resp.text().catch(() => "");
+            throw new EmbeddingHttpError(resp.status, `${resp.status}${body ? `: ${body.slice(0,200)}` : " status code (no body)"}`);
+          }
+          const json = (await resp.json()) as {
+            result?: { data?: number[][] };
+            errors?: Array<{ message?: string }>;
+          };
+          if (!json.result?.data) {
+            throw new Error(json.errors?.[0]?.message ?? "empty Cloudflare response");
+          }
+          const results = json.result.data.map((vec) => ({
+            vector: vec,
+            dimension: vec.length,
+          }));
+          if (this._dimension === null && results.length > 0) {
+            this._dimension = results[0].dimension;
+          }
+          if (results.length !== cleaned.length) {
+            throw new Error("Cloudflare embedding returned an unexpected result count");
+          }
+          return results;
+        } finally {
+          clearTimeout(timer);
+        }
+      } catch (err) {
+        // Wrap AbortError / timeout
+        if (err instanceof DOMException && err.name === "AbortError") {
+          lastError = new EmbeddingHttpError(408, "Request timed out");
+        } else {
+          lastError = err;
+        }
+        if (attempt < MAX_RETRIES && isRetryable(lastError)) {
+          const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+          console.error(
+            `[embedding] attempt ${attempt + 1}/${MAX_RETRIES + 1} failed, retrying in ${delay}ms: ${lastError instanceof Error ? lastError.message : String(lastError)}`
+          );
+          await sleep(delay);
+        } else {
+          break;
+        }
+      }
+    }
+    throw lastError;
+  }
+
   async embedSingle(text: string): Promise<EmbeddingResult> {
     const results = await this.embed([text]);
     return results[0];
@@ -103,6 +209,6 @@ export class EmbeddingProvider {
   }
 
   get provider(): string {
-    return "OpenAI";
+    return this.cloudflareNative ? "Cloudflare Workers AI" : "OpenAI";
   }
 }
