@@ -92,7 +92,7 @@ export class CodebaseService {
 
   async search(request: SearchRequest): Promise<SearchResponse> {
     const canonicalPath = await this.canonicalPath(request.path);
-    return this.indexer.withCommittedRead(canonicalPath, async () => {
+    const preflight = await this.indexer.withCommittedRead(canonicalPath, async () => {
       const codebase = this.repository.getCodebase(canonicalPath);
       const collectionName = codebase?.collectionName ?? this.indexer.collectionName(canonicalPath);
       if (!codebase || !(await this.store.hasTable(collectionName))) {
@@ -103,38 +103,47 @@ export class CodebaseService {
         );
       }
 
-      const limit = Math.min(Math.max(1, request.limit ?? 10), 50);
-      const queryEmbedding = await this.embedding.embedSingle(request.query);
+      return { limit: Math.min(Math.max(1, request.limit ?? 10), 50) };
+    });
+    const queryEmbedding = await this.embedding.embedSingle(request.query);
+    const snapshot = await this.indexer.withCommittedRead(canonicalPath, async () => {
+      const codebase = this.repository.getCodebase(canonicalPath);
+      const collectionName = codebase?.collectionName ?? this.indexer.collectionName(canonicalPath);
+      if (!codebase || !(await this.store.hasTable(collectionName))) {
+        throw new ServiceError("CODEBASE_NOT_INDEXED", "The codebase has not been indexed", "Index the codebase before searching it");
+      }
       const results = await this.store.search(
         collectionName,
         queryEmbedding.vector,
         request.query,
-        limit,
+        preflight.limit,
       );
-      const extensionFilter = request.extensionFilter ?? [];
-      const filtered = extensionFilter.length === 0
-        ? results
-        : results.filter((result) => extensionFilter.some(
-          (extension) => extension.toLowerCase() === result.fileExtension.toLowerCase(),
-        ));
-      const bestByOverlap = new Map<string, SearchResult>();
-      for (const result of filtered) {
-        const key = `${result.relativePath}:${result.startLine}-${result.endLine}`;
-        const previous = bestByOverlap.get(key);
-        if (!previous || result.score > previous.score) bestByOverlap.set(key, result);
-      }
-      const perFile = new Map<string, SearchResult[]>();
-      for (const result of bestByOverlap.values()) {
-        const items = perFile.get(result.relativePath) ?? [];
-        if (items.length < 2) items.push(result);
-        perFile.set(result.relativePath, items);
-      }
-      return {
-        path: canonicalPath,
-        results: [...perFile.values()].flat().sort((a, b) => b.score - a.score).slice(0, limit),
-        indexStatus: codebase.status,
-      };
+      return { results, indexStatus: codebase.status };
     });
+    const extensionFilter = request.extensionFilter ?? [];
+    const results = snapshot.results;
+    const filtered = extensionFilter.length === 0
+      ? results
+      : results.filter((result) => extensionFilter.some(
+        (extension) => extension.toLowerCase() === result.fileExtension.toLowerCase(),
+      ));
+    const bestByOverlap = new Map<string, SearchResult>();
+    for (const result of filtered) {
+      const key = `${result.relativePath}:${result.startLine}-${result.endLine}`;
+      const previous = bestByOverlap.get(key);
+      if (!previous || result.score > previous.score) bestByOverlap.set(key, result);
+    }
+    const perFile = new Map<string, SearchResult[]>();
+    for (const result of bestByOverlap.values()) {
+      const items = perFile.get(result.relativePath) ?? [];
+      if (items.length < 2) items.push(result);
+      perFile.set(result.relativePath, items);
+    }
+    return {
+      path: canonicalPath,
+      results: [...perFile.values()].flat().sort((a, b) => b.score - a.score).slice(0, preflight.limit),
+      indexStatus: snapshot.indexStatus,
+    };
   }
 
   async clear(request: ClearRequest): Promise<EnqueueResult> {

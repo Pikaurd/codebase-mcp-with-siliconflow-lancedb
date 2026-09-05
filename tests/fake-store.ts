@@ -85,6 +85,8 @@ export class FakeStore {
     return [...new Set((this.tables.get(name) ?? []).map((row) => row.relativePath))];
   }
 
+  async compactTable(_name: string): Promise<void> {}
+
   async search(
     name: string,
     _queryVector: number[],

@@ -9,7 +9,7 @@ import type { Chunk, Document, EmbeddingLike, IndexOptions } from "./types.js";
 export interface SynchronizerLike {
   loadIgnoreFiles(): Promise<void>;
   discoverFiles(): Promise<string[]>;
-  detectChanges(): Promise<{ changed: string[]; removed: string[] }>;
+  detectChanges(currentFiles?: string[]): Promise<{ changed: string[]; removed: string[] }>;
   readFile(filePath: string): Promise<string>;
   hashContent(content: string): string;
   setHashes(hashes: Record<string, string>): void;
@@ -146,6 +146,7 @@ function toDocuments(
 export class Indexer {
   private readonly createSynchronizer: SynchronizerFactory;
   private readonly access = new CollectionAccessCoordinator();
+  private readonly maintenanceChanges = new Map<string, number>();
 
   constructor(private readonly dependencies: IndexerDependencies) {
     this.createSynchronizer = dependencies.createSynchronizer
@@ -188,20 +189,22 @@ export class Indexer {
 
     try {
       const hasTable = await store.hasTable(collectionName);
+      const currentFiles = await synchronizer.discoverFiles();
       let changed: string[];
       let removed: string[];
       if (options.force || !hasTable) {
-        changed = await synchronizer.discoverFiles();
+        changed = currentFiles;
         const current = new Set(changed.map((filePath) => path.relative(codebasePath, filePath)));
         removed = Object.keys(hashes).filter((relativePath) => !current.has(relativePath));
         // Force rebuild: start from an empty table so per-file replaceByRelativePath
         // (delete + add) doesn't scan tens of thousands of stale rows on every file.
         await store.prepareTable(collectionName);
+        this.maintenanceChanges.delete(codebasePath);
       } else {
-        ({ changed, removed } = await synchronizer.detectChanges());
+        ({ changed, removed } = await synchronizer.detectChanges(currentFiles));
       }
       const discovered = new Set(
-        (options.force || !hasTable ? changed : await synchronizer.discoverFiles())
+        currentFiles
           .map((filePath) => path.relative(codebasePath, filePath)),
       );
 
@@ -220,6 +223,7 @@ export class Indexer {
               codebasePath,
               () => store.deleteByRelativePaths(collectionName, [relativePath]),
             );
+            this.maintenanceChanges.set(codebasePath, (this.maintenanceChanges.get(codebasePath) ?? 0) + 1);
             this.ensureJobRunning(completedJobId);
             synchronizer.removeHash(relativePath);
             repository.removeFileHash(codebasePath, relativePath);
@@ -296,6 +300,7 @@ export class Indexer {
               codebasePath,
               () => store.replaceByRelativePath(collectionName, relativePath, documents),
             );
+            this.maintenanceChanges.set(codebasePath, (this.maintenanceChanges.get(codebasePath) ?? 0) + 1);
           }
           this.ensureJobRunning(completedJobId);
           synchronizer.updateHash(relativePath, contentHash);
@@ -320,6 +325,7 @@ export class Indexer {
       // (files that were removed since the last index) are cleaned up.
       if (isFullRebuild) {
         repository.replaceFileHashes(codebasePath, synchronizer.getHashes());
+        this.maintenanceChanges.delete(codebasePath);
       }
 
       if (failedFiles > 0) {
@@ -343,7 +349,22 @@ export class Indexer {
             await store.deleteByRelativePaths(collectionName, orphanPaths);
           }
         });
+        if (orphanPaths.length <= 50) {
+          this.maintenanceChanges.set(codebasePath, (this.maintenanceChanges.get(codebasePath) ?? 0) + orphanPaths.length);
+        } else {
+          this.maintenanceChanges.delete(codebasePath);
+        }
         totalChunks = Math.max(0, await store.getRowCount(collectionName));
+      }
+
+      if ((this.maintenanceChanges.get(codebasePath) ?? 0) >= 20) {
+        this.ensureJobRunning(completedJobId);
+        try {
+          await this.access.write(codebasePath, () => store.compactTable(collectionName));
+          this.maintenanceChanges.delete(codebasePath);
+        } catch {
+          console.error("[indexer] collection maintenance failed; retrying on next successful index");
+        }
       }
 
       this.ensureJobRunning(completedJobId);
@@ -384,6 +405,7 @@ export class Indexer {
     await this.access.write(codebasePath, async () => {
       await this.dependencies.store.dropTable(collectionName);
       this.dependencies.repository.deleteCodebase(codebasePath);
+      this.maintenanceChanges.delete(codebasePath);
     });
     return { processedFiles: 0, totalFiles: 0, totalChunks: 0 };
   }

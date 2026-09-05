@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { FileSynchronizer } from "../src/sync.js";
@@ -156,6 +156,22 @@ describe("FileSynchronizer", () => {
   });
 
   describe("detectChanges", () => {
+    it("uses an explicit discovery snapshot without rediscovering", async () => {
+      await ensureDir(TMP_DIR);
+      await writeFile(path.join(TMP_DIR, "same.ts"), "same");
+      const syncer = new FileSynchronizer(TMP_DIR);
+      syncer.setHashes({ "same.ts": syncer.hashContent("same") });
+      const discover = vi.spyOn(syncer, "discoverFiles");
+      expect(await syncer.detectChanges([path.join(TMP_DIR, "same.ts")])).toEqual({ changed: [], removed: [] });
+      expect(discover).not.toHaveBeenCalled();
+    });
+
+    it("treats an empty explicit snapshot as all files removed", async () => {
+      const syncer = new FileSynchronizer(TMP_DIR);
+      syncer.setHashes({ "gone.ts": syncer.hashContent("gone") });
+      expect(await syncer.detectChanges([])).toEqual({ changed: [], removed: ["gone.ts"] });
+    });
+
     it("detects new, modified, and removed files", async () => {
       await ensureDir(TMP_DIR);
       await writeFile(path.join(TMP_DIR, "existing.ts"), `// existing`);

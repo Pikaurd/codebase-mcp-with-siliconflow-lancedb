@@ -12,6 +12,7 @@ export interface VectorStoreLike {
   hasTable(name: string): Promise<boolean>;
   getRowCount(name: string): Promise<number>;
   getAllRelativePaths(name: string): Promise<string[]>;
+  compactTable(name: string): Promise<void>;
   search(
     name: string,
     queryVector: number[],
@@ -61,17 +62,8 @@ export class LanceDBStore {
 
   async compactTable(name: string): Promise<void> {
     const db = this.ensureConnected();
-    try {
-      const tbl = await db.openTable(name);
-      const compactable = tbl as Table & {
-        compactFiles?: () => Promise<unknown>;
-        cleanupOldVersions?: (olderThan?: Date, deleteUnverified?: boolean) => Promise<unknown>;
-      };
-      await compactable.compactFiles?.();
-      await compactable.cleanupOldVersions?.(undefined, true);
-    } catch {
-      // silently skip if compact fails (Node.js LanceDB may not support these)
-    }
+    const tbl = await db.openTable(name);
+    await tbl.optimize();
   }
 
   async getTableSize(name: string): Promise<string> {
@@ -347,7 +339,7 @@ export class LanceDBStore {
       // first 10 rows (LanceDB's default query limit). A full scan needs an
       // explicit limit; getAllRelativePaths is used by orphan reconcile, so a
       // truncated scan would silently miss orphaned files.
-      const all = await tbl.query().limit(Number.MAX_SAFE_INTEGER).toArray();
+      const all = await tbl.query().select(["relativePath"]).limit(Number.MAX_SAFE_INTEGER).toArray();
       return [...new Set(all.map((r: Record<string, unknown>) => r.relativePath as string))];
     } catch {
       return [];

@@ -177,6 +177,14 @@ Search reads the latest committed index while an update is running. Indexing
 the same path and options again reuses the active job; `force` and
 `clear_index` serialize behind current work for that path.
 
+Each incremental index discovers its file list once, then hashes every
+discovered file to detect changes. Collection maintenance accumulates successful
+file changes and runs LanceDB's default `optimize()` after 20 changes. LanceDB's
+default retention keeps old versions for seven days; a failed maintenance attempt is retried by a later successful index. Search releases the
+collection read lock while waiting for query embedding, then rechecks the
+committed index before querying, so updates and clears can complete during that
+wait.
+
 ## Safe errors and troubleshooting
 
 Public failures are sanitized and include a stable `code`, `suggestedAction`,

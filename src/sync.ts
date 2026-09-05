@@ -283,11 +283,11 @@ export class FileSynchronizer {
    * Returns paths of files that have changed (new or modified) and
    * paths of files that have been removed.
    */
-  async detectChanges(): Promise<{
+  async detectChanges(currentFiles?: string[]): Promise<{
     changed: string[];
     removed: string[];
   }> {
-    const currentFiles = await this.discoverFiles();
+    currentFiles ??= await this.discoverFiles();
     const changed: string[] = [];
     const currentPaths = new Set<string>();
 

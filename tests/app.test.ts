@@ -79,6 +79,49 @@ afterEach(async () => {
 });
 
 describe("CodebaseService", () => {
+  it("allows an update to complete while query embedding is paused", async () => {
+    const { root, service, embedding } = await fixture();
+    await writeFixtureFile(root, "src/a.ts", "export const oldText = true;");
+    const initial = await service.index({ path: root }); await waitForJob(service, initial.jobId);
+    const gate = embedding.pauseTextContaining("query_gate query");
+    const search = service.search({ path: root, query: "query_gate query" });
+    await gate.entered;
+    try {
+      await writeFixtureFile(root, "src/a.ts", "export const query_gate = true;");
+      const update = await service.index({ path: root });
+      await waitForJob(service, update.jobId);
+      await expect(service.getStatus({ jobId: update.jobId })).resolves.toMatchObject({ job: { state: "completed" } });
+    } finally {
+      gate.release();
+    }
+    expect((await search).results.map(({ text }) => text).join("\n")).toContain("query_gate");
+  });
+
+  it("rechecks after query embedding when clear completes", async () => {
+    const { root, service, embedding } = await fixture();
+    await writeFixtureFile(root, "src/a.ts", "export const clearable = true;");
+    const initial = await service.index({ path: root }); await waitForJob(service, initial.jobId);
+    const gate = embedding.pauseTextContaining("query_gate");
+    const search = service.search({ path: root, query: "query_gate" });
+    const searchError = expect(search).rejects.toMatchObject({ code: "CODEBASE_NOT_INDEXED" });
+    await gate.entered;
+    try {
+      const cleared = await service.clear({ path: root });
+      await waitForJob(service, cleared.jobId);
+      await expect(service.getStatus({ jobId: cleared.jobId })).resolves.toMatchObject({ job: { state: "completed" } });
+    } finally {
+      gate.release();
+    }
+    await searchError;
+  });
+
+  it("does not embed when preflight finds no indexed table", async () => {
+    const { root, service, embedding } = await fixture();
+    const embed = vi.spyOn(embedding, "embedSingle");
+    await expect(service.search({ path: root, query: "missing" })).rejects.toMatchObject({ code: "CODEBASE_NOT_INDEXED" });
+    expect(embed).not.toHaveBeenCalled();
+  });
+
   it("records file-level progress for indexing and clear jobs", async () => {
     const { root, service, repository, embedding } = await fixture();
     await writeFixtureFile(root, "src/a.ts", "export const progress = true;");
