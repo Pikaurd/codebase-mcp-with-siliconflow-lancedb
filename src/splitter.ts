@@ -138,7 +138,7 @@ export function splitCode(
 
   if (!rule || lines.length < 5) {
     // Fallback: simple paragraph-based splitting
-    return simpleSplit(content, filePath, codebasePath, language);
+    return boundChunks(simpleSplit(content, filePath, codebasePath, language));
   }
 
   // AST-aware splitting: group lines into logical blocks
@@ -190,7 +190,39 @@ export function splitCode(
     }
   }
 
-  return chunks.filter((c) => c.content.trim().length > 10);
+  return boundChunks(chunks);
+}
+
+/**
+ * Safety net: if any chunk is one enormous unbreakable line (minified JSON,
+ * generated data, etc.), the line-based splitters above can't break it and it
+ * becomes a single chunk far past the model's per-input token limit, which
+ * makes embedding fail (400) permanently. Hard-split such oversized content
+ * by character so every chunk stays bounded and indexable.
+ */
+function boundChunks(chunks: Chunk[]): Chunk[] {
+  const bounded: Chunk[] = [];
+  for (const c of chunks) {
+    if (c.content.length <= MAX_CHUNK_CHARS) {
+      bounded.push(c);
+      continue;
+    }
+    const win = MAX_CHUNK_CHARS;
+    let lineNo = c.startLine;
+    for (let off = 0; off < c.content.length; off += win) {
+      const piece = c.content.slice(off, off + win);
+      const newlines = (piece.match(/\n/g) ?? []).length;
+      bounded.push({
+        content: piece,
+        startLine: lineNo,
+        endLine: lineNo + newlines,
+        metadata: { ...c.metadata },
+      });
+      lineNo += newlines + 1;
+    }
+  }
+
+  return bounded.filter((c) => c.content.trim().length > 10);
 }
 
 function splitLargeBlock(

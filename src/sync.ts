@@ -48,6 +48,7 @@ const DEFAULT_IGNORE_PATTERNS = [
   "generated",
   "**/resource/k.dart",
   "assets/**/*.json",
+  "**/assets/**/*.json",
   ".flutter-plugins*",
   "*.g.yaml",
   // Assets (not code)
