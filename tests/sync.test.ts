@@ -116,6 +116,35 @@ describe("FileSynchronizer", () => {
       expect(files).not.toContain(buildFile);
       expect(files).not.toContain(path.join(subDir, "secret.ts"));
     });
+
+    it("excludes nested assets JSON tracked in a submodule (DEFAULT_IGNORE applies to git ls-files)", async () => {
+      const subDir = path.join(TMP_DIR, "submodule");
+      await ensureDir(subDir);
+
+      const { execSync } = await import("child_process");
+      execSync("git init", { cwd: subDir });
+
+      // Code that should be indexed
+      await writeFile(path.join(TMP_DIR, "root.ts"), `export const x = 1;`);
+      await writeFile(path.join(subDir, "lib", "mod.ts"), `export const y = 2;`);
+      // Asset data JSON in a nested assets dir (must be excluded even though
+      // it is git-tracked in the submodule and not covered by .gitignore)
+      await writeFile(
+        path.join(subDir, "assets", "dice", "gift.json"),
+        `{"gift": "data"}`,
+      );
+
+      execSync("git add -A", { cwd: subDir });
+      execSync("git commit -m init --allow-empty", { cwd: subDir });
+
+      const syncer = new FileSynchronizer(TMP_DIR);
+      await syncer.loadIgnoreFiles();
+      const files = await syncer.discoverFiles();
+
+      expect(files).toContain(path.join(TMP_DIR, "root.ts"));
+      expect(files).toContain(path.join(subDir, "lib", "mod.ts"));
+      expect(files).not.toContain(path.join(subDir, "assets", "dice", "gift.json"));
+    });
   });
 
   describe("SUPPORTED_EXTENSIONS filter", () => {

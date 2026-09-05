@@ -250,6 +250,10 @@ export class FileSynchronizer {
   ): Promise<void> {
     const canonicalTarget = await this.realPathWithinRoot(filePath, canonicalRoot);
     if (!canonicalTarget) return;
+    // Apply the custom ignore rules to every discovery source, including git
+    // ls-files output from submodules, which does not honor them on its own.
+    const relativePath = path.relative(this.codebasePath, filePath);
+    if (this.ig.ignores(relativePath)) return;
     try {
       if ((await fs.stat(canonicalTarget)).isFile()) result.push(filePath);
     } catch {
